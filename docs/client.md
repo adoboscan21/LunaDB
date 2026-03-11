@@ -1,20 +1,20 @@
-# 🚀 Memory Tools CLI Client Documentation 🚀
+# 🚀 LunaDB CLI Client Documentation 🚀
 
-The `memory-tools-client` is a command-line interface (CLI) for direct, secure interaction with the `memory-tools-server` via its custom TLS-encrypted TCP protocol. Designed for speed, security, and scalability.
+The `lunadb-client` is a command-line interface (CLI) for direct, secure interaction with the `lunadb-server` via its custom TLS-encrypted TCP protocol. Designed for speed, security, and scalability.
 
 ## ▶️ How to Run
 
-To start the client, you must provide the address of the `memory-tools-server`. You can also include credentials for automatic login using flags.
+To start the client, you must provide the address of the `lunadb-server`. You can also include credentials for automatic login using flags.
 
 **Locally:**
 
-> `./bin/memory-tools-client`
+> `./bin/lunadb-client`
 >
-> `./bin/memory-tools-client -u admin -p adminpass localhost:5876`
+> `./bin/lunadb-client -u admin -p adminpass localhost:5876`
 
 **Docker 🐳:**
 
-> `sudo docker exec -it <containerId> memory-tools-client -u root -p rootpass localhost:5876`
+> `sudo docker exec -it <containerId> lunadb-client -u root -p rootpass localhost:5876`
 
 _Important for Testing: To pass JSON files instead of raw strings, ensure you have a `json/` directory in your working path (e.g., `./json/payload.json`). The CLI will auto-resolve filenames passed as arguments._
 
@@ -58,7 +58,7 @@ Low-level administrative operations.
 
 ## 📦 Transactions
 
-Memory Tools supports ACID-like transactions. Group multiple write operations (`set`, `update`, `delete`) and execute them atomically.
+LunaDB supports ACID-like transactions. Group multiple write operations (`set`, `update`, `delete`) and execute them atomically.
 
 - **`begin`**: Starts a new transaction block. The prompt will show `[TX]`. Read commands are disabled in this mode.
 

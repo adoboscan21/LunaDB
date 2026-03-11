@@ -191,7 +191,7 @@ func (c *cli) handleLogin(args string) error {
 
 // handleHelp handles the "help" command.
 func (c *cli) handleHelp(args string) error {
-	fmt.Println(colorInfo("\nMemory Tools CLI Help"))
+	fmt.Println(colorInfo("\nLunaDB CLI Help"))
 	fmt.Println("---------------------")
 	fmt.Println("All commands require their full name. The collection must be specified as the first argument where required.")
 	fmt.Println("---------------------")

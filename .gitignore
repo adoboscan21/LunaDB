@@ -35,7 +35,7 @@ profile.cov
 # Go workspace file
 go.work
 go.work.sum
-memory-tools
+lunadb
 
 # env file
 .env

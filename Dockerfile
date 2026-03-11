@@ -26,8 +26,8 @@ RUN mkdir -p certificates && \
     -addext "subjectAltName = DNS:localhost,IP:127.0.0.1"
 
 # Build the Go applications with specific names.
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix nocgo -o memory-tools-server ./main.go
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix nocgo -o memory-tools-client ./cmd/client/
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix nocgo -o lunadb-server ./main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix nocgo -o lunadb-client ./cmd/client/
 
 # --- Stage 2: Production ---
 # Use a minimal base image for the production environment.
@@ -40,8 +40,8 @@ WORKDIR /data
 RUN mkdir -p certificates collections json
 
 # Copy the binaries to a standard location in the PATH.
-COPY --from=builder /app/memory-tools-server /usr/local/bin/
-COPY --from=builder /app/memory-tools-client /usr/local/bin/
+COPY --from=builder /app/lunadb-server /usr/local/bin/
+COPY --from=builder /app/lunadb-client /usr/local/bin/
 
 # Copy the certificates. The server looks for a relative 'certificates' directory.
 COPY --from=builder /app/certificates/server.crt ./certificates/
@@ -51,4 +51,4 @@ COPY --from=builder /app/certificates/server.key ./certificates/
 #EXPOSE 5876
 
 # Command to execute the entrypoint script when the container starts.
-CMD "memory-tools-server"
+CMD "lunadb-server"

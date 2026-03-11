@@ -29,7 +29,7 @@ func main() {
 	}
 
 	// TLS Connection Configuration
-	fmt.Println(colorInfo("Connecting to Memory Tools server at ", addr))
+	fmt.Println(colorInfo("Connecting to LunaDB server at ", addr))
 	caCert, err := os.ReadFile(*certPathPtr)
 	if err != nil {
 		log.Fatal(colorErr(fmt.Sprintf("Failed to read server certificate '%s': %v", *certPathPtr, err)))
