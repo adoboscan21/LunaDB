@@ -1,0 +1,15 @@
+services:
+  server: # Define a service named 'server' for your Go application
+    build:
+      context: . # Look for the Dockerfile in the current directory
+      dockerfile: Dockerfile # Specify the name of your Dockerfile
+    ports:
+      - "5876:5876" # Map host port
+    volumes:
+      - ./collections:/data/collections
+      - ./backups:/data/backups
+      - ./logs:/data/logs
+      - ./json:/data/json
+    restart: always # Always restart the container if it stops
+    env_file:
+      - ./.env

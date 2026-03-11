@@ -1,0 +1,355 @@
+package store
+
+import (
+	"fmt"
+	"log/slog"
+	"sort"
+	"sync"
+	"time"
+
+	"lunadb/internal/globalconst"
+
+	"github.com/google/uuid"
+	"go.mongodb.org/mongo-driver/bson"
+)
+
+type TransactionState int
+
+const (
+	StateActive TransactionState = iota
+	StatePreparing
+	StateCommitted
+	StateAborted
+)
+
+// TransactionOpType is an enum for the type of operation in a transaction.
+type TransactionOpType int
+
+const (
+	OpTypeSet TransactionOpType = iota
+	OpTypeUpdate
+	OpTypeDelete
+)
+
+// WriteOperation represents a single write action within a transaction.
+type WriteOperation struct {
+	Collection string
+	Key        string
+	Value      []byte
+	OpType     TransactionOpType
+}
+
+// Transaction holds the state and operations for a single transaction.
+type Transaction struct {
+	ID        string
+	State     TransactionState
+	WriteSet  []WriteOperation
+	startTime time.Time
+	mu        sync.RWMutex
+}
+
+// TransactionManager is the central coordinator for all transactions.
+type TransactionManager struct {
+	transactions map[string]*Transaction
+	mu           sync.RWMutex
+	cm           *CollectionManager
+	gcQuitChan   chan struct{}
+	wg           sync.WaitGroup
+}
+
+// NewTransactionManager creates a new instance of the transaction manager.
+func NewTransactionManager(cm *CollectionManager) *TransactionManager {
+	return &TransactionManager{
+		transactions: make(map[string]*Transaction),
+		cm:           cm,
+		gcQuitChan:   make(chan struct{}),
+	}
+}
+
+// StartGC starts the garbage collector goroutine.
+func (tm *TransactionManager) StartGC(timeout, interval time.Duration) {
+	tm.wg.Add(1)
+	go tm.runGC(timeout, interval)
+	slog.Info("Transaction garbage collector started", "timeout", timeout, "interval", interval)
+}
+
+// StopGC stops the garbage collector and waits for it to finish.
+func (tm *TransactionManager) StopGC() {
+	close(tm.gcQuitChan)
+	tm.wg.Wait()
+	slog.Info("Transaction garbage collector stopped.")
+}
+
+// runGC is the main loop for the garbage collector.
+func (tm *TransactionManager) runGC(timeout, interval time.Duration) {
+	defer tm.wg.Done()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			slog.Debug("Running transaction garbage collection scan...")
+			var txIDsToRollback []string
+			tm.mu.RLock()
+			for txID, tx := range tm.transactions {
+				tx.mu.RLock()
+				if tx.State == StateActive && time.Since(tx.startTime) > timeout {
+					txIDsToRollback = append(txIDsToRollback, txID)
+				}
+				tx.mu.RUnlock()
+			}
+			tm.mu.RUnlock()
+			if len(txIDsToRollback) > 0 {
+				slog.Warn("Found abandoned transactions to roll back", "count", len(txIDsToRollback))
+				for _, txID := range txIDsToRollback {
+					slog.Info("Rolling back abandoned transaction", "txID", txID)
+					if err := tm.Rollback(txID); err != nil {
+						slog.Error("Error rolling back abandoned transaction", "txID", txID, "error", err)
+					}
+				}
+			}
+		case <-tm.gcQuitChan:
+			return
+		}
+	}
+}
+
+// Begin starts a new transaction and registers it, returning its unique ID.
+func (tm *TransactionManager) Begin() (string, error) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	txID := uuid.New().String()
+	tx := &Transaction{
+		ID:        txID,
+		State:     StateActive,
+		WriteSet:  make([]WriteOperation, 0),
+		startTime: time.Now(),
+	}
+
+	tm.transactions[txID] = tx
+	slog.Debug("TransactionManager: new transaction begun", "txID", txID)
+	return txID, nil
+}
+
+// RecordWrite adds a write operation to an active transaction's journal.
+func (tm *TransactionManager) RecordWrite(txID string, op WriteOperation) error {
+	tx, err := tm.getTransaction(txID)
+	if err != nil {
+		return err
+	}
+
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+
+	if tx.State != StateActive {
+		return fmt.Errorf("transaction %s is not active", txID)
+	}
+
+	tx.WriteSet = append(tx.WriteSet, op)
+	return nil
+}
+
+// getTransaction is an internal helper to safely get a transaction.
+func (tm *TransactionManager) getTransaction(txID string) (*Transaction, error) {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+
+	tx, exists := tm.transactions[txID]
+	if !exists {
+		return nil, fmt.Errorf("transaction with ID %s not found", txID)
+	}
+	return tx, nil
+}
+
+// removeTransaction is an internal helper to clean up a finished transaction.
+func (tm *TransactionManager) removeTransaction(txID string) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	delete(tm.transactions, txID)
+}
+
+// Commit processes the final save of the transaction.
+func (tm *TransactionManager) Commit(txID string) error {
+	tx, err := tm.getTransaction(txID)
+	if err != nil {
+		return err
+	}
+
+	tx.mu.Lock()
+	if tx.State != StateActive {
+		tx.mu.Unlock()
+		return fmt.Errorf("cannot commit transaction %s; state is not active", txID)
+	}
+	writeSetToProcess := tx.WriteSet
+	tx.State = StatePreparing
+	tx.mu.Unlock()
+
+	// --- PRE-VALIDATION SWEEP ---
+	slog.Debug("TransactionManager: starting pre-commit validation", "txID", txID)
+	for _, op := range writeSetToProcess {
+		col := tm.cm.GetCollection(op.Collection)
+		_, keyExists := col.Get(op.Key)
+
+		if op.OpType == OpTypeSet && keyExists {
+			slog.Warn("Commit failed: attempt to SET a key that already exists", "txID", txID, "key", op.Key)
+			tm.Rollback(txID)
+			return fmt.Errorf("commit failed: key '%s' in collection '%s' already exists. Use update instead", op.Key, op.Collection)
+		}
+
+		if (op.OpType == OpTypeUpdate || op.OpType == OpTypeDelete) && !keyExists {
+			slog.Warn("Commit failed: attempt to UPDATE/DELETE a key that does not exist", "txID", txID, "key", op.Key)
+			tm.Rollback(txID)
+			return fmt.Errorf("commit failed: key '%s' in collection '%s' does not exist to be updated or deleted", op.Key, op.Collection)
+		}
+	}
+	slog.Debug("TransactionManager: pre-commit validation successful", "txID", txID)
+
+	tx.mu.Lock()
+	tx.WriteSet = nil
+	tx.mu.Unlock()
+
+	slog.Debug("TransactionManager: enriching WriteSet with timestamps", "txID", txID)
+	now := time.Now().UTC()
+
+	enrichedWriteSet := make([]WriteOperation, 0, len(writeSetToProcess))
+	for _, op := range writeSetToProcess {
+		if op.OpType == OpTypeDelete {
+			enrichedWriteSet = append(enrichedWriteSet, op)
+			continue
+		}
+
+		col := tm.cm.GetCollection(op.Collection)
+		var data bson.M
+		if err := bson.Unmarshal(op.Value, &data); err != nil {
+			slog.Warn("Could not unmarshal value during commit, skipping enrichment", "key", op.Key)
+			enrichedWriteSet = append(enrichedWriteSet, op)
+			continue
+		}
+
+		data[globalconst.UPDATED_AT] = now
+		if _, found := col.Get(op.Key); !found {
+			data[globalconst.CREATED_AT] = now
+		}
+
+		enrichedValue, err := bson.Marshal(data)
+		if err != nil {
+			slog.Error("Could not marshal enriched value during commit", "key", op.Key, "error", err)
+			tm.Rollback(txID)
+			return fmt.Errorf("failed to marshal enriched data for key %s: %w", op.Key, err)
+		}
+
+		op.Value = enrichedValue
+		enrichedWriteSet = append(enrichedWriteSet, op)
+	}
+
+	slog.Debug("TransactionManager: entering Prepare Phase", "txID", txID, "op_count", len(enrichedWriteSet))
+	opsByShard := make(map[*Shard][]WriteOperation)
+	keysByShard := make(map[*Shard][]string)
+
+	for _, op := range enrichedWriteSet {
+		col := tm.cm.GetCollection(op.Collection).(*InMemStore)
+		shard := col.getShard(op.Key)
+		opsByShard[shard] = append(opsByShard[shard], op)
+		keysByShard[shard] = append(keysByShard[shard], op.Key)
+	}
+
+	// --- CORRECCIÓN DEADLOCK: ORDENAMIENTO DETERMINISTA DE SHARDS ---
+	type shardLockOrder struct {
+		shard *Shard
+		id    string
+	}
+	var sortedShards []shardLockOrder
+	for shard := range keysByShard {
+		sortedShards = append(sortedShards, shardLockOrder{
+			shard: shard,
+			id:    fmt.Sprintf("%p", shard), // Ordenar por dirección de memoria
+		})
+	}
+
+	sort.Slice(sortedShards, func(i, j int) bool {
+		return sortedShards[i].id < sortedShards[j].id
+	})
+
+	for _, slo := range sortedShards {
+		if err := slo.shard.lockKeys(txID, keysByShard[slo.shard]); err != nil {
+			slog.Warn("TransactionManager: lock failed during Prepare Phase, initiating rollback", "txID", txID, "error", err)
+			tm.Rollback(txID)
+			return fmt.Errorf("prepare failed: %w", err)
+		}
+	}
+
+	// Fase de Preparación (ya segura contra deadlocks)
+	for shard, ops := range opsByShard {
+		for _, op := range ops {
+			if err := shard.prepareWrite(txID, op); err != nil {
+				slog.Warn("TransactionManager: prepareWrite failed, initiating rollback", "txID", txID, "error", err)
+				tm.Rollback(txID)
+				return fmt.Errorf("prepare failed: %w", err)
+			}
+		}
+	}
+
+	slog.Debug("TransactionManager: Prepare Phase successful. Entering Commit Phase.", "txID", txID)
+
+	tx.mu.Lock()
+	tx.State = StateCommitted
+	tx.mu.Unlock()
+
+	for shard := range keysByShard {
+		var associatedIndexManager *IndexManager
+		if len(opsByShard[shard]) > 0 {
+			firstOp := opsByShard[shard][0]
+			col := tm.cm.GetCollection(firstOp.Collection).(*InMemStore)
+			associatedIndexManager = col.indexes
+		}
+		shard.commitAppliedChanges(txID, associatedIndexManager)
+	}
+
+	collectionsToSave := make(map[string]DataStore)
+	for _, op := range enrichedWriteSet {
+		if _, exists := collectionsToSave[op.Collection]; !exists {
+			collectionsToSave[op.Collection] = tm.cm.GetCollection(op.Collection)
+		}
+	}
+
+	for name, store := range collectionsToSave {
+		tm.cm.EnqueueSaveTask(name, store)
+	}
+
+	tm.removeTransaction(txID)
+	return nil
+}
+
+// Rollback rolls back a transaction, discarding all its changes.
+func (tm *TransactionManager) Rollback(txID string) error {
+	tx, err := tm.getTransaction(txID)
+	if err != nil {
+		return nil
+	}
+
+	tx.mu.Lock()
+	if tx.State == StateCommitted || tx.State == StateAborted {
+		tx.mu.Unlock()
+		return nil
+	}
+	tx.State = StateAborted
+	tx.mu.Unlock()
+
+	slog.Debug("TransactionManager: rolling back transaction", "txID", txID)
+
+	keysByShard := make(map[*Shard][]string)
+	for _, op := range tx.WriteSet {
+		col := tm.cm.GetCollection(op.Collection).(*InMemStore)
+		shard := col.getShard(op.Key)
+		keysByShard[shard] = append(keysByShard[shard], op.Key)
+	}
+
+	for shard := range keysByShard {
+		shard.rollbackChanges(txID)
+	}
+
+	tm.removeTransaction(txID)
+	return nil
+}
