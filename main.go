@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"log/slog"
 	"lunadb/internal/config"
@@ -358,6 +359,7 @@ func main() {
 	// --- Graceful Shutdown ---
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	fmt.Println("🚀 ¡LunaDB core engine initialized. The sharded in-memory store is fully operational and ready to accept connections!")
 	<-sigChan
 
 	slog.Info("Termination signal received. Starting graceful shutdown...")
