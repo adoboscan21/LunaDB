@@ -2,9 +2,9 @@ package main
 
 import (
 	"bytes"
+	stdjson "encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"lunadb/internal/protocol"
 	"os"
 	"sort"
@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/olekukonko/tablewriter"
-	"go.mongodb.org/mongo-driver/bson"
 )
 
 // getCommands defines all available commands, their help, handler, and category.
@@ -90,6 +89,10 @@ func (c *cli) handleBegin(args string) error {
 	fmt.Println("---")
 	if status == protocol.StatusOk {
 		c.inTransaction = true
+		// Refrescar autocompletado
+		c.rlConfig.AutoComplete = c.getCompleter()
+		c.rl.SetConfig(c.rlConfig)
+
 		fmt.Println(colorOK("√ Transaction started."))
 	}
 	return nil
@@ -118,9 +121,17 @@ func (c *cli) handleCommit(args string) error {
 	fmt.Println("---")
 	if status == protocol.StatusOk {
 		c.inTransaction = false
+		// Refrescar autocompletado
+		c.rlConfig.AutoComplete = c.getCompleter()
+		c.rl.SetConfig(c.rlConfig)
+
 		fmt.Println(colorOK("√ Transaction committed successfully."))
 	} else {
 		c.inTransaction = false
+		// Refrescar autocompletado incluso si falla
+		c.rlConfig.AutoComplete = c.getCompleter()
+		c.rl.SetConfig(c.rlConfig)
+
 		fmt.Println(colorErr("Transaction failed on the server and was rolled back."))
 	}
 	return nil
@@ -148,6 +159,10 @@ func (c *cli) handleRollback(args string) error {
 	table.Render()
 	fmt.Println("---")
 	c.inTransaction = false
+	// Refrescar autocompletado
+	c.rlConfig.AutoComplete = c.getCompleter()
+	c.rl.SetConfig(c.rlConfig)
+
 	if status == protocol.StatusOk {
 		fmt.Println(colorInfo("√ Transaction rolled back."))
 	}
@@ -229,7 +244,7 @@ func (c *cli) handleHelp(args string) error {
 
 // handleExit handles the "exit" command.
 func (c *cli) handleExit(args string) error {
-	return io.EOF
+	return ErrExit
 }
 
 // handleClear handles the "clear" command.
@@ -659,7 +674,7 @@ func (c *cli) handleItemDeleteMany(args string) error {
 	}
 
 	var keysToDelete []string
-	if err := bson.Unmarshal(rawJSON, &keysToDelete); err != nil {
+	if err := stdjson.Unmarshal(rawJSON, &keysToDelete); err != nil {
 		return fmt.Errorf("invalid keys JSON array: %w", err)
 	}
 

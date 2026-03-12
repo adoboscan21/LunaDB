@@ -88,7 +88,7 @@ func main() {
 	collectionPersister := &persistence.CollectionPersisterImpl{}
 	collectionManager := store.NewCollectionManager(collectionPersister, cfg.NumShards)
 	transactionManager := store.NewTransactionManager(collectionManager)
-	transactionManager.StartGC(5*time.Minute, 10*time.Minute)
+	transactionManager.StartGC(5*time.Minute, 1*time.Minute)
 
 	// --- Data Loading and WAL Recovery ---
 	slog.Info("Loading data from snapshots...")

@@ -12,7 +12,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 )
 
-// getCompleter returns the readline.AutoCompleter based on the user's authentication status.
+// getCompleter returns the readline.AutoCompleter based on the user's authentication status and transaction state.
 func (c *cli) getCompleter() readline.AutoCompleter {
 	if !c.isAuthenticated {
 		return readline.NewPrefixCompleter(
@@ -23,7 +23,8 @@ func (c *cli) getCompleter() readline.AutoCompleter {
 		)
 	}
 
-	return readline.NewPrefixCompleter(
+	// Comandos base disponibles siempre que se está autenticado
+	baseItems := []readline.PrefixCompleterInterface{
 		readline.PcItem("user",
 			readline.PcItem("create"),
 			readline.PcItem("update"),
@@ -55,13 +56,24 @@ func (c *cli) getCompleter() readline.AutoCompleter {
 			),
 			readline.PcItem("query", readline.PcItemDynamic(c.fetchCollectionNames, readline.PcItemDynamic(c.fetchJSONFileNames))),
 		),
-		readline.PcItem("begin"),
-		readline.PcItem("commit"),
-		readline.PcItem("rollback"),
 		readline.PcItem("clear"),
 		readline.PcItem("help"),
 		readline.PcItem("exit"),
-	)
+	}
+
+	// Lógica condicional: mostrar comandos de transacción según el estado actual
+	if c.inTransaction {
+		baseItems = append(baseItems,
+			readline.PcItem("commit"),
+			readline.PcItem("rollback"),
+		)
+	} else {
+		baseItems = append(baseItems,
+			readline.PcItem("begin"),
+		)
+	}
+
+	return readline.NewPrefixCompleter(baseItems...)
 }
 
 // fetchCollectionNames dynamically fetches a list of collection names from the server for autocompletion.

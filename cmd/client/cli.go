@@ -13,6 +13,8 @@ import (
 	"github.com/chzyer/readline"
 )
 
+var ErrExit = errors.New("exit requested by user")
+
 type command struct {
 	help     string
 	handler  func(c *cli, args string) error
@@ -134,15 +136,28 @@ func (c *cli) mainLoop() error {
 		}
 
 		startTime := time.Now()
-		if err := handler.handler(c, args); err != nil {
-			if errors.Is(err, io.EOF) {
-				// MEJORA: Prevenir transacciones zombis si el comando fue 'exit'
+
+		c.connMutex.Lock()
+		err = handler.handler(c, args)
+		c.connMutex.Unlock()
+
+		if err != nil {
+			// 1. Caso en el que el usuario escribió 'exit'
+			if errors.Is(err, ErrExit) {
 				if c.inTransaction {
 					fmt.Println(colorErr("\n[!] Active transaction detected. Rolling back before exit..."))
 					c.handleRollback("")
 				}
 				break
 			}
+
+			// 2. Caso en el que la conexión de red murió (servidor apagado/caído)
+			if errors.Is(err, io.EOF) || strings.Contains(err.Error(), "broken pipe") || strings.Contains(err.Error(), "connection reset") {
+				fmt.Println(colorErr("\n[!] Connection to the server was lost (Server might be down). Exiting client safely..."))
+				break // Salimos inmediatamente sin intentar hacer rollback en la red muerta
+			}
+
+			// 3. Cualquier otro error normal de comandos
 			fmt.Println(colorErr("Command failed: ", err))
 		}
 		duration := time.Since(startTime)

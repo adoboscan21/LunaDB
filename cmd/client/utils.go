@@ -238,13 +238,19 @@ func printDynamicTable(dataBytes []byte) error {
 	headerSet := make(map[string]bool)
 	var parsedDocs []map[string]any
 
-	// Normalizamos los elementos a map[string]any
+	// Normalizamos los elementos a map[string]any (Soportando primitivos)
 	for _, docAny := range objectArrayResults {
 		if doc, ok := docAny.(map[string]any); ok {
+			// Es un objeto estándar
 			parsedDocs = append(parsedDocs, doc)
 			for key := range doc {
 				headerSet[key] = true
 			}
+		} else {
+			// Es un valor primitivo (Ej: arreglo de strings como listas de índices o colecciones)
+			primitiveDoc := map[string]any{"Item": docAny}
+			parsedDocs = append(parsedDocs, primitiveDoc)
+			headerSet["Item"] = true
 		}
 	}
 
@@ -288,8 +294,6 @@ func printDynamicTable(dataBytes []byte) error {
 }
 
 func (c *cli) readRawResponse() (protocol.ResponseStatus, string, []byte, error) {
-	c.connMutex.Lock()
-	defer c.connMutex.Unlock()
 
 	statusByte := make([]byte, 1)
 	if _, err := io.ReadFull(c.conn, statusByte); err != nil {
