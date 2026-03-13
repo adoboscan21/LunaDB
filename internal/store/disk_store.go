@@ -1,7 +1,3 @@
-/* ==========================================================
-   Ruta y Archivo: ./internal/store/disk_store.go
-   ========================================================== */
-
 package store
 
 import (
@@ -34,7 +30,6 @@ func NewDiskStore(name string) *DiskStore {
 	}
 }
 
-// Set serializa el valor y lo guarda en disco usando Update directo (Latencia ultra baja)
 func (s *DiskStore) Set(key string, value []byte, ttl time.Duration) {
 	record := ItemRecord{
 		Value:     value,
@@ -48,12 +43,14 @@ func (s *DiskStore) Set(key string, value []byte, ttl time.Duration) {
 		return
 	}
 
-	// OPTIMIZADO: Cambiado de Batch a Update para evitar el retraso de agrupación de bbolt
-	GlobalDB.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(s.collectionName)
-		return b.Put([]byte(key), recordBytes)
-	})
+	// 🔥 OPTIMIZADO: Enviamos al Batcher y esperamos la confirmación segura
+	err = GlobalBatcher.Submit(s.collectionName, []byte(key), recordBytes, false)
+	if err != nil {
+		slog.Error("Failed to write to disk batch", "key", key, "error", err)
+		return
+	}
 
+	// Solo actualizamos el índice en RAM si el disco guardó con éxito
 	indexedFields := s.indexes.ListIndexes()
 	newDataForIndex := extractIndexedValues(value, indexedFields)
 	if newDataForIndex != nil {
@@ -92,14 +89,12 @@ func (s *DiskStore) SetMany(items map[string][]byte) {
 func (s *DiskStore) Delete(key string) {
 	oldValue, found := s.Get(key)
 
-	// OPTIMIZADO: Cambiado de Batch a Update para no bloquear esperando otras peticiones
-	GlobalDB.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(s.collectionName)
-		if b == nil {
-			return nil
-		}
-		return b.Delete([]byte(key))
-	})
+	// 🔥 OPTIMIZADO: Eliminación en Lote
+	err := GlobalBatcher.Submit(s.collectionName, []byte(key), nil, true)
+	if err != nil {
+		slog.Error("Failed to delete from disk batch", "key", key, "error", err)
+		return
+	}
 
 	if found {
 		indexedFields := s.indexes.ListIndexes()

@@ -1519,6 +1519,7 @@ type aggAccumulator struct {
 	HasVal      []bool
 }
 
+// performRawAggregations realiza agregaciones sobre un slice en memoria
 func (h *ConnectionHandler) performRawAggregations(items []bson.Raw, query *Query) (any, error) {
 	var ops []aggOp
 	for alias, agg := range query.Aggregations {
@@ -1557,9 +1558,11 @@ func (h *ConnectionHandler) performRawAggregations(items []bson.Raw, query *Quer
 			}
 		}
 
+		// 🔥 ZERO-ALLOCATION FAST PATH: El compilador de Go no asigna memoria para esto.
 		acc, exists := groups[string(keyBuffer)]
 
 		if !exists {
+			// Solo creamos el string permanente si el grupo es nuevo
 			groupStrKey := string(keyBuffer)
 			groupVals := make([]any, len(query.GroupBy))
 
@@ -1603,6 +1606,7 @@ func (h *ConnectionHandler) performRawAggregations(items []bson.Raw, query *Quer
 				continue
 			}
 
+			// 🔥 MATEMÁTICA SIN REFLEXIÓN (Directo de los bytes)
 			var num float64
 			isNum := true
 			switch val.Type {
@@ -1747,10 +1751,11 @@ func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *
 			}
 		}
 
-		groupStrKey := string(keyBuffer)
-		acc, exists := groups[groupStrKey]
+		// 🔥 ZERO-ALLOCATION FAST PATH
+		acc, exists := groups[string(keyBuffer)]
 
 		if !exists {
+			groupStrKey := string(keyBuffer) // Solo asignamos RAM 1 vez por grupo
 			groupVals := make([]any, len(query.GroupBy))
 			if len(query.GroupBy) > 0 {
 				for i := range query.GroupBy {
@@ -1791,6 +1796,7 @@ func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *
 				continue
 			}
 
+			// 🔥 MATEMÁTICA SIN REFLEXIÓN (Directo de los bytes)
 			var num float64
 			isNum := true
 			switch val.Type {
@@ -1826,7 +1832,6 @@ func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *
 		return true
 	})
 
-	// Ensamblaje final de la tabla de resultados
 	var aggregatedResults []bson.M
 	for groupKey, acc := range groups {
 		resultRow := make(bson.M)
