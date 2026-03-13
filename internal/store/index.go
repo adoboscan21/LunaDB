@@ -179,40 +179,8 @@ func (im *IndexManager) addToIndex(index *Index, docKey string, value any) {
 	}
 }
 
-// removeFromIndex removes a document key from an index.
+// removeFromIndex implements Lazy Delete for O(1) performance during bulk operations.
 func (im *IndexManager) removeFromIndex(index *Index, docKey string, value any) {
-	removeFast := func(keys []string, target string) []string {
-		for i, k := range keys {
-			if k == target {
-				// Fast delete sin preservar el orden original (O(1))
-				keys[i] = keys[len(keys)-1]
-				return keys[:len(keys)-1]
-			}
-		}
-		return keys
-	}
-
-	if fVal, ok := valueToFloat64(value); ok {
-		key := NumericKey{Value: fVal}
-		if item, found := index.numericTree.Get(key); found {
-			item.Keys = removeFast(item.Keys, docKey)
-			if len(item.Keys) == 0 {
-				index.numericTree.Delete(item)
-			} else {
-				index.numericTree.ReplaceOrInsert(item)
-			}
-		}
-	} else if sVal, ok := value.(string); ok {
-		key := StringKey{Value: sVal}
-		if item, found := index.stringTree.Get(key); found {
-			item.Keys = removeFast(item.Keys, docKey)
-			if len(item.Keys) == 0 {
-				index.stringTree.Delete(item)
-			} else {
-				index.stringTree.ReplaceOrInsert(item)
-			}
-		}
-	}
 }
 
 // Update updates the indexes for a given document.

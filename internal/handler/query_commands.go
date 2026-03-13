@@ -138,6 +138,18 @@ func (h *ConnectionHandler) processCollectionQuery(collectionName string, query 
 	}
 
 	// =====================================================================
+	// 🚀 1.5. OPTIMIZACIÓN: STREAMING AGGREGATION (ON-THE-FLY)
+	// =====================================================================
+
+	isPureAggregation := len(query.Filter) == 0 && len(query.Lookups) == 0 && len(query.Projection) == 0 && len(query.Aggregations) > 0 && query.Distinct == ""
+
+	if isPureAggregation {
+		// En lugar de cargar 100,000 documentos en un array en la RAM para luego iterarlos,
+		// delegamos la tarea a un lector continuo que suma "al vuelo".
+		return h.streamAggregations(colStore, query)
+	}
+
+	// =====================================================================
 	// 2. EJECUCIÓN NORMAL (Carga de datos transaccional desde disco/bbolt)
 	// =====================================================================
 
@@ -1360,7 +1372,7 @@ func getRawValue(doc bson.Raw, path string) (any, bool) {
 	case bsontype.String:
 		return val.StringValue(), true
 	case bsontype.Int32:
-		return int64(val.Int32()), true // Normalizamos a int64 para compare()
+		return int64(val.Int32()), true
 	case bsontype.Int64:
 		return val.Int64(), true
 	case bsontype.Boolean:
@@ -1371,7 +1383,6 @@ func getRawValue(doc bson.Raw, path string) (any, bool) {
 		return val.String(), true
 	}
 }
-
 func getRawValueByParsedPath(doc bson.Raw, keys []string) (any, bool) {
 	val, err := doc.LookupErr(keys...)
 	if err != nil || val.Type == bsontype.Null {
@@ -1693,4 +1704,181 @@ func asMap(val any) (bson.M, bool) {
 		return d.Map(), true
 	}
 	return nil, false
+}
+
+// streamAggregations realiza matemáticas directamente sobre el flujo del disco sin almacenar arrays.
+func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *Query) (any, error) {
+	var ops []aggOp
+	for alias, agg := range query.Aggregations {
+		var parsed []string
+		if agg.Field != "*" {
+			parsed = strings.Split(agg.Field, ".")
+		}
+		ops = append(ops, aggOp{Alias: alias, Func: agg.Func, Field: agg.Field, ParsedPath: parsed})
+	}
+
+	parsedGroupPaths := make([][]string, len(query.GroupBy))
+	for i, field := range query.GroupBy {
+		parsedGroupPaths[i] = strings.Split(field, ".")
+	}
+
+	groups := make(map[string]*aggAccumulator)
+	keyBuffer := make([]byte, 0, 128)
+
+	// Leemos directo del disco con Zero-Copy y procesamos al instante
+	colStore.StreamAll(func(k string, vBytes []byte) bool {
+		item := bson.Raw(vBytes)
+		keyBuffer = keyBuffer[:0]
+
+		if len(query.GroupBy) == 0 {
+			keyBuffer = append(keyBuffer, "_no_group_"...)
+		} else {
+			for i := range query.GroupBy {
+				if i > 0 {
+					keyBuffer = append(keyBuffer, '|')
+				}
+				val, err := item.LookupErr(parsedGroupPaths[i]...)
+				if err == nil && val.Type != bsontype.Null {
+					keyBuffer = append(keyBuffer, byte(val.Type))
+					keyBuffer = append(keyBuffer, val.Value...)
+				} else {
+					keyBuffer = append(keyBuffer, 0)
+				}
+			}
+		}
+
+		groupStrKey := string(keyBuffer)
+		acc, exists := groups[groupStrKey]
+
+		if !exists {
+			groupVals := make([]any, len(query.GroupBy))
+			if len(query.GroupBy) > 0 {
+				for i := range query.GroupBy {
+					if val, err := item.LookupErr(parsedGroupPaths[i]...); err == nil && val.Type != bsontype.Null {
+						groupVals[i] = extractBsonRawValue(val)
+					}
+				}
+			}
+
+			acc = &aggAccumulator{
+				GroupValues: groupVals,
+				Sums:        make([]float64, len(ops)),
+				Mins:        make([]float64, len(ops)),
+				Maxs:        make([]float64, len(ops)),
+				Counts:      make([]int, len(ops)),
+				HasVal:      make([]bool, len(ops)),
+			}
+			groups[groupStrKey] = acc
+		}
+
+		acc.Count++
+
+		for i, op := range ops {
+			if op.Field == "*" {
+				if op.Func == globalconst.AggCount {
+					acc.Counts[i]++
+				}
+				continue
+			}
+
+			val, err := item.LookupErr(op.ParsedPath...)
+			if err != nil || val.Type == bsontype.Null {
+				continue
+			}
+
+			acc.Counts[i]++
+			if op.Func == globalconst.AggCount {
+				continue
+			}
+
+			var num float64
+			isNum := true
+			switch val.Type {
+			case bsontype.Double:
+				num = val.Double()
+			case bsontype.Int32:
+				num = float64(val.Int32())
+			case bsontype.Int64:
+				num = float64(val.Int64())
+			default:
+				isNum = false
+			}
+
+			if !isNum {
+				continue
+			}
+
+			switch op.Func {
+			case globalconst.AggSum, globalconst.AggAvg:
+				acc.Sums[i] += num
+			case globalconst.AggMin:
+				if !acc.HasVal[i] || num < acc.Mins[i] {
+					acc.Mins[i] = num
+					acc.HasVal[i] = true
+				}
+			case globalconst.AggMax:
+				if !acc.HasVal[i] || num > acc.Maxs[i] {
+					acc.Maxs[i] = num
+					acc.HasVal[i] = true
+				}
+			}
+		}
+		return true
+	})
+
+	// Ensamblaje final de la tabla de resultados
+	var aggregatedResults []bson.M
+	for groupKey, acc := range groups {
+		resultRow := make(bson.M)
+
+		if len(query.GroupBy) > 0 && groupKey != "_no_group_" {
+			for i, field := range query.GroupBy {
+				setNestedValue(resultRow, field, acc.GroupValues[i])
+			}
+		}
+
+		for i, op := range ops {
+			var finalVal any
+			switch op.Func {
+			case globalconst.AggCount:
+				finalVal = acc.Counts[i]
+			case globalconst.AggSum:
+				if acc.HasVal[i] || acc.Counts[i] > 0 {
+					finalVal = acc.Sums[i]
+				} else {
+					finalVal = nil
+				}
+			case globalconst.AggAvg:
+				if acc.Counts[i] > 0 {
+					finalVal = acc.Sums[i] / float64(acc.Counts[i])
+				} else {
+					finalVal = nil
+				}
+			case globalconst.AggMin:
+				if acc.HasVal[i] {
+					finalVal = acc.Mins[i]
+				} else {
+					finalVal = nil
+				}
+			case globalconst.AggMax:
+				if acc.HasVal[i] {
+					finalVal = acc.Maxs[i]
+				} else {
+					finalVal = nil
+				}
+			}
+			resultRow[op.Alias] = finalVal
+		}
+
+		if len(query.Having) > 0 {
+			rowBytes, _ := bson.Marshal(resultRow)
+			if h.matchFilter(rowBytes, query.Having) {
+				aggregatedResults = append(aggregatedResults, resultRow)
+			}
+		} else {
+			aggregatedResults = append(aggregatedResults, resultRow)
+		}
+	}
+
+	return aggregatedResults, nil
 }
