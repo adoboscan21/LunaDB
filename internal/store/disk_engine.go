@@ -20,6 +20,7 @@ func InitDiskEngine(dbPath string) error {
 		Timeout:        5 * time.Second,
 		NoSync:         true, // 🔥 Desactiva el bloqueo de disco síncrono
 		NoFreelistSync: true,
+		FreelistType:   bbolt.FreelistMapType,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to open bbolt database: %w", err)

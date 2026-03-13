@@ -74,7 +74,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	dbPath := filepath.Join("data", "lunadb.db")
+	dbPath := filepath.Join("data", "luna.db")
 	if err := store.InitDiskEngine(dbPath); err != nil {
 		slog.Error("Fatal error starting Disk Engine", "error", err)
 		os.Exit(1)
