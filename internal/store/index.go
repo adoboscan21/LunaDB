@@ -1,5 +1,5 @@
 /* ==========================================================
-   Ruta y Archivo: ./internal/store/index.go (Anteriormente inmem.go)
+   Ruta y Archivo: ./internal/store/index.go
    ========================================================== */
 
 package store
@@ -79,13 +79,13 @@ const btreeDegree = 32
 // NumericKey implements the item for the numeric B-Tree.
 type NumericKey struct {
 	Value float64
-	Keys  map[string]struct{}
+	Keys  []string // OPTIMIZADO: Slice en lugar de map para iteración ultra rápida
 }
 
 // StringKey implements the item for the string B-Tree.
 type StringKey struct {
 	Value string
-	Keys  map[string]struct{}
+	Keys  []string // OPTIMIZADO: Slice en lugar de map para iteración ultra rápida
 }
 
 // numericLess provides the comparison logic for NumericKey items.
@@ -114,7 +114,7 @@ func NewIndex() *Index {
 
 // --- IndexManager for B-Trees ---
 
-// IndexManager manages all indexes for a single Store (DiskStore now).
+// IndexManager manages all indexes for a single Store.
 type IndexManager struct {
 	mu      sync.RWMutex
 	indexes map[string]*Index
@@ -164,27 +164,38 @@ func (im *IndexManager) addToIndex(index *Index, docKey string, value any) {
 		key := NumericKey{Value: fVal}
 		item, found := index.numericTree.Get(key)
 		if !found {
-			item = NumericKey{Value: fVal, Keys: make(map[string]struct{})}
+			item = NumericKey{Value: fVal, Keys: make([]string, 0, 1)}
 		}
-		item.Keys[docKey] = struct{}{}
+		item.Keys = append(item.Keys, docKey)
 		index.numericTree.ReplaceOrInsert(item)
 	} else if sVal, ok := value.(string); ok {
 		key := StringKey{Value: sVal}
 		item, found := index.stringTree.Get(key)
 		if !found {
-			item = StringKey{Value: sVal, Keys: make(map[string]struct{})}
+			item = StringKey{Value: sVal, Keys: make([]string, 0, 1)}
 		}
-		item.Keys[docKey] = struct{}{}
+		item.Keys = append(item.Keys, docKey)
 		index.stringTree.ReplaceOrInsert(item)
 	}
 }
 
 // removeFromIndex removes a document key from an index.
 func (im *IndexManager) removeFromIndex(index *Index, docKey string, value any) {
+	removeFast := func(keys []string, target string) []string {
+		for i, k := range keys {
+			if k == target {
+				// Fast delete sin preservar el orden original (O(1))
+				keys[i] = keys[len(keys)-1]
+				return keys[:len(keys)-1]
+			}
+		}
+		return keys
+	}
+
 	if fVal, ok := valueToFloat64(value); ok {
 		key := NumericKey{Value: fVal}
 		if item, found := index.numericTree.Get(key); found {
-			delete(item.Keys, docKey)
+			item.Keys = removeFast(item.Keys, docKey)
 			if len(item.Keys) == 0 {
 				index.numericTree.Delete(item)
 			} else {
@@ -194,7 +205,7 @@ func (im *IndexManager) removeFromIndex(index *Index, docKey string, value any) 
 	} else if sVal, ok := value.(string); ok {
 		key := StringKey{Value: sVal}
 		if item, found := index.stringTree.Get(key); found {
-			delete(item.Keys, docKey)
+			item.Keys = removeFast(item.Keys, docKey)
 			if len(item.Keys) == 0 {
 				index.stringTree.Delete(item)
 			} else {
@@ -254,7 +265,7 @@ func (im *IndexManager) Lookup(field string, value any) ([]string, bool) {
 		return nil, false
 	}
 
-	var foundKeys map[string]struct{}
+	var foundKeys []string
 	if fVal, ok := valueToFloat64(value); ok {
 		if item, found := index.numericTree.Get(NumericKey{Value: fVal}); found {
 			foundKeys = item.Keys
@@ -269,10 +280,9 @@ func (im *IndexManager) Lookup(field string, value any) ([]string, bool) {
 		return []string{}, true
 	}
 
-	keys := make([]string, 0, len(foundKeys))
-	for k := range foundKeys {
-		keys = append(keys, k)
-	}
+	// Devolvemos una copia del slice para evitar mutaciones externas que corrompan el B-Tree
+	keys := make([]string, len(foundKeys))
+	copy(keys, foundKeys)
 	return keys, true
 }
 
@@ -317,7 +327,7 @@ func (im *IndexManager) LookupRange(field string, low, high any, lowInclusive, h
 					return false
 				}
 			}
-			for k := range item.Keys {
+			for _, k := range item.Keys {
 				unionKeys[k] = struct{}{}
 			}
 			return true
@@ -336,7 +346,7 @@ func (im *IndexManager) LookupRange(field string, low, high any, lowInclusive, h
 
 		if hasLowBound && !lowInclusive {
 			if item, found := index.numericTree.Get(lowKey); found {
-				for k := range item.Keys {
+				for _, k := range item.Keys {
 					delete(unionKeys, k)
 				}
 			}
@@ -361,7 +371,7 @@ func (im *IndexManager) LookupRange(field string, low, high any, lowInclusive, h
 					return false
 				}
 			}
-			for k := range item.Keys {
+			for _, k := range item.Keys {
 				unionKeys[k] = struct{}{}
 			}
 			return true
@@ -380,7 +390,7 @@ func (im *IndexManager) LookupRange(field string, low, high any, lowInclusive, h
 
 		if hasLowBound && !lowInclusive {
 			if item, found := index.stringTree.Get(lowKey); found {
-				for k := range item.Keys {
+				for _, k := range item.Keys {
 					delete(unionKeys, k)
 				}
 			}
@@ -416,7 +426,7 @@ func (im *IndexManager) StreamByIndex(field string, descending bool, callback fu
 
 	if descending {
 		index.stringTree.Descend(func(item StringKey) bool {
-			for k := range item.Keys {
+			for _, k := range item.Keys {
 				if !callback(k) {
 					keepGoing = false
 					return false
@@ -428,7 +438,7 @@ func (im *IndexManager) StreamByIndex(field string, descending bool, callback fu
 			return true
 		}
 		index.numericTree.Descend(func(item NumericKey) bool {
-			for k := range item.Keys {
+			for _, k := range item.Keys {
 				if !callback(k) {
 					keepGoing = false
 					return false
@@ -438,7 +448,7 @@ func (im *IndexManager) StreamByIndex(field string, descending bool, callback fu
 		})
 	} else {
 		index.numericTree.Ascend(func(item NumericKey) bool {
-			for k := range item.Keys {
+			for _, k := range item.Keys {
 				if !callback(k) {
 					keepGoing = false
 					return false
@@ -450,7 +460,7 @@ func (im *IndexManager) StreamByIndex(field string, descending bool, callback fu
 			return true
 		}
 		index.stringTree.Ascend(func(item StringKey) bool {
-			for k := range item.Keys {
+			for _, k := range item.Keys {
 				if !callback(k) {
 					keepGoing = false
 					return false
@@ -462,7 +472,7 @@ func (im *IndexManager) StreamByIndex(field string, descending bool, callback fu
 	return true
 }
 
-// GetDistinctValues extrae los valores únicos directamente recorriendo el B-Tree en O(K).
+// GetDistinctValues extrae los valores únicos directamente recorriendo el B-Tree.
 func (im *IndexManager) GetDistinctValues(field string) ([]any, bool) {
 	im.mu.RLock()
 	defer im.mu.RUnlock()

@@ -180,6 +180,26 @@ func main() {
 	// --- 6. Tareas en Segundo Plano ---
 	shutdownChan := make(chan struct{})
 
+	// Background Syncer (Garantiza durabilidad en disco cada 100ms)
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		slog.Info("Starting Disk Syncer (100ms interval)")
+		for {
+			select {
+			case <-ticker.C:
+				if store.GlobalDB != nil {
+					store.GlobalDB.Sync()
+				}
+			case <-shutdownChan:
+				if store.GlobalDB != nil {
+					store.GlobalDB.Sync()
+				}
+				return
+			}
+		}
+	}()
+
 	// Worker de Limpieza de TTL (Lazy Expiration asistida)
 	go func() {
 		ticker := time.NewTicker(cfg.TtlCleanInterval)

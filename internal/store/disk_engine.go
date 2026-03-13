@@ -16,7 +16,11 @@ var GlobalDB *bbolt.DB
 func InitDiskEngine(dbPath string) error {
 	slog.Info("Initializing Disk Engine (bbolt)...", "path", dbPath)
 
-	db, err := bbolt.Open(dbPath, 0600, &bbolt.Options{Timeout: 5 * time.Second})
+	db, err := bbolt.Open(dbPath, 0600, &bbolt.Options{
+		Timeout:        5 * time.Second,
+		NoSync:         true, // 🔥 Desactiva el bloqueo de disco síncrono
+		NoFreelistSync: true,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to open bbolt database: %w", err)
 	}

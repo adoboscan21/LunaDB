@@ -10,6 +10,7 @@ import (
 
 	"go.etcd.io/bbolt"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/bsontype"
 )
 
 // DiskStore implementa DataStore usando bbolt.
@@ -33,7 +34,7 @@ func NewDiskStore(name string) *DiskStore {
 	}
 }
 
-// Set serializa el valor y lo guarda en disco usando BATCH (Agrupación ultra rápida)
+// Set serializa el valor y lo guarda en disco usando Update directo (Latencia ultra baja)
 func (s *DiskStore) Set(key string, value []byte, ttl time.Duration) {
 	record := ItemRecord{
 		Value:     value,
@@ -47,8 +48,8 @@ func (s *DiskStore) Set(key string, value []byte, ttl time.Duration) {
 		return
 	}
 
-	// BATCH: Múltiples rutinas concurrentes escribirán en 1 solo fsync
-	GlobalDB.Batch(func(tx *bbolt.Tx) error {
+	// OPTIMIZADO: Cambiado de Batch a Update para evitar el retraso de agrupación de bbolt
+	GlobalDB.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(s.collectionName)
 		return b.Put([]byte(key), recordBytes)
 	})
@@ -87,11 +88,12 @@ func (s *DiskStore) SetMany(items map[string][]byte) {
 	}
 }
 
-// Delete borra usando BATCH para soportar alta concurrencia
+// Delete borra usando Update directo para soportar alta velocidad en peticiones individuales
 func (s *DiskStore) Delete(key string) {
 	oldValue, found := s.Get(key)
 
-	GlobalDB.Batch(func(tx *bbolt.Tx) error {
+	// OPTIMIZADO: Cambiado de Batch a Update para no bloquear esperando otras peticiones
+	GlobalDB.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(s.collectionName)
 		if b == nil {
 			return nil
@@ -110,16 +112,8 @@ func (s *DiskStore) Delete(key string) {
 
 // DeleteMany borra múltiples ítems en una sola transacción ACID (Bulk Delete)
 func (s *DiskStore) DeleteMany(keys []string) {
-	oldDatas := make(map[string]map[string]any)
+	oldDatas := make(map[string]map[string]any, len(keys))
 	indexedFields := s.indexes.ListIndexes()
-
-	for _, k := range keys {
-		if oldVal, found := s.Get(k); found {
-			if oldDataForIndex := extractIndexedValues(oldVal, indexedFields); oldDataForIndex != nil {
-				oldDatas[k] = oldDataForIndex
-			}
-		}
-	}
 
 	GlobalDB.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(s.collectionName)
@@ -127,7 +121,17 @@ func (s *DiskStore) DeleteMany(keys []string) {
 			return nil
 		}
 		for _, k := range keys {
-			b.Delete([]byte(k))
+			kb := []byte(k)
+			// 🔥 Lectura ultra rápida DENTRO de la misma transacción (Evita N+1 transactions)
+			if oldVal := b.Get(kb); oldVal != nil {
+				var record ItemRecord
+				if err := bson.Unmarshal(oldVal, &record); err == nil {
+					if oldDataForIndex := extractIndexedValues(record.Value, indexedFields); oldDataForIndex != nil {
+						oldDatas[k] = oldDataForIndex
+					}
+				}
+			}
+			b.Delete(kb)
 		}
 		return nil
 	})
@@ -173,12 +177,25 @@ func (s *DiskStore) StreamAll(callback func(key string, value []byte) bool) {
 		c := b.Cursor()
 
 		for k, v := c.First(); k != nil; k, v = c.Next() {
-			var record ItemRecord
-			if err := bson.Unmarshal(v, &record); err == nil {
-				if record.TTL == 0 || time.Since(record.CreatedAt) <= record.TTL {
-					if !callback(string(k), record.Value) {
-						break
+			// 🔥 ZERO-COPY FAST PATH: Leemos el BSON binario sin deserializar el struct
+			raw := bson.Raw(v)
+
+			// Verificación de TTL a nivel binario para no perder funcionalidad
+			if ttlVal := raw.Lookup("t"); ttlVal.Type != bsontype.Null {
+				ttl := ttlVal.Int64() // time.Duration se guarda como int64
+				if ttl > 0 {
+					createdAt := raw.Lookup("c").Time()
+					if time.Since(createdAt) > time.Duration(ttl) {
+						continue // Expirado
 					}
+				}
+			}
+
+			// Extraemos los bytes puros del documento interior
+			if val := raw.Lookup("v"); val.Type == bsontype.Binary {
+				_, data := val.Binary()
+				if !callback(string(k), data) {
+					break
 				}
 			}
 		}
@@ -235,7 +252,7 @@ func (s *DiskStore) UpdateMany(items map[string][]byte) (int, []string) {
 
 	// Actualizamos RAM de golpe
 	for key, data := range indexUpdates {
-		s.indexes.Update(key, nil, data) // Simplificado: no borra el viejo index, asume sobreescritura (o puedes hacer Remove primero si el índice cambió)
+		s.indexes.Update(key, nil, data) // Simplificado: no borra el viejo index, asume sobreescritura
 	}
 
 	return updatedCount, failedKeys
