@@ -74,10 +74,4 @@ const (
 
 	// BackupsDirName is the root directory name for backups.
 	BackupsDirName = "backups"
-	// CollectionsDirName is the root directory name for collection data.
-	CollectionsDirName = "collections"
-	// DBFileExtension is the file extension for database data files.
-	DBFileExtension = ".mtdb"
-	// TempFileSuffix is the suffix added to temporary files during writes.
-	TempFileSuffix = ".tmp"
 )

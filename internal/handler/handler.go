@@ -1,3 +1,7 @@
+/* ==========================================================
+   Ruta y Archivo: ./internal/handler/handler.go
+   ========================================================== */
+
 package handler
 
 import (
@@ -5,12 +9,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"lunadb/internal/persistence"
-	"lunadb/internal/protocol"
-	"lunadb/internal/store"
-	"lunadb/internal/wal"
 	"net"
 	"sync"
+
+	"lunadb/internal/protocol"
+	"lunadb/internal/store"
 )
 
 type ActivityUpdater interface {
@@ -19,10 +22,8 @@ type ActivityUpdater interface {
 
 // ConnectionHandler manages a single client connection, including state like authentication and transactions.
 type ConnectionHandler struct {
-	Wal                  *wal.WAL
 	MainStore            store.DataStore
 	CollectionManager    *store.CollectionManager
-	BackupManager        *persistence.BackupManager
 	ActivityUpdater      ActivityUpdater
 	IsAuthenticated      bool
 	AuthenticatedUser    string
@@ -43,10 +44,8 @@ var connectionHandlerPool = sync.Pool{
 
 // Reset clears the handler's state for reuse from the pool.
 func (h *ConnectionHandler) Reset() {
-	h.Wal = nil
 	h.MainStore = nil
 	h.CollectionManager = nil
-	h.BackupManager = nil
 	h.ActivityUpdater = nil
 	h.IsAuthenticated = false
 	h.AuthenticatedUser = ""
@@ -59,10 +58,8 @@ func (h *ConnectionHandler) Reset() {
 
 // GetConnectionHandlerFromPool retrieves a handler from the pool and initializes it.
 func GetConnectionHandlerFromPool(
-	wal *wal.WAL,
 	mainStore store.DataStore,
 	colManager *store.CollectionManager,
-	backupManager *persistence.BackupManager,
 	txManager *store.TransactionManager,
 	updater ActivityUpdater,
 	conn net.Conn,
@@ -78,10 +75,8 @@ func GetConnectionHandlerFromPool(
 		}
 	}
 
-	h.Wal = wal
 	h.MainStore = mainStore
 	h.CollectionManager = colManager
-	h.BackupManager = backupManager
 	h.TransactionManager = txManager
 	h.ActivityUpdater = updater
 	h.IsLocalhostConn = isLocal
@@ -97,33 +92,6 @@ func PutConnectionHandlerToPool(h *ConnectionHandler) {
 	}
 	h.Reset()
 	connectionHandlerPool.Put(h)
-}
-
-// isWriteCommand checks if a command type modifies data.
-func isWriteCommand(cmdType protocol.CommandType) bool {
-	switch cmdType {
-	case
-		protocol.CmdSet,
-		protocol.CmdCollectionCreate,
-		protocol.CmdCollectionDelete,
-		protocol.CmdCollectionIndexCreate,
-		protocol.CmdCollectionIndexDelete,
-		protocol.CmdCollectionItemSet,
-		protocol.CmdCollectionItemSetMany,
-		protocol.CmdCollectionItemDelete,
-		protocol.CmdCollectionItemDeleteMany,
-		protocol.CmdCollectionItemUpdate,
-		protocol.CmdCollectionItemUpdateMany,
-		protocol.CmdChangeUserPassword,
-		protocol.CmdUserCreate,
-		protocol.CmdUserUpdate,
-		protocol.CmdUserDelete,
-		protocol.CmdCommit,
-		protocol.CmdRestore:
-		return true
-	default:
-		return false
-	}
 }
 
 // HandleConnection is the main loop for processing commands from a single connection.
@@ -144,34 +112,17 @@ func (h *ConnectionHandler) HandleConnection(conn net.Conn) {
 
 		h.ActivityUpdater.UpdateActivity()
 
-		var reader io.Reader = conn
-
-		if h.Wal != nil && isWriteCommand(cmdType) {
-			payload, err := protocol.ReadCommandPayload(conn, cmdType)
-			if err != nil {
-				slog.Error("Failed to read command payload for WAL", "error", err, "command_type", cmdType)
-				protocol.WriteResponse(conn, protocol.StatusError, "Internal server error reading command", nil)
-				continue
-			}
-
-			needsManualWalWrite := cmdType == protocol.CmdCollectionItemSet ||
-				cmdType == protocol.CmdCollectionItemSetMany
-
-			if !needsManualWalWrite {
-				entry := wal.WalEntry{
-					CommandType: cmdType,
-					Payload:     payload,
-				}
-
-				if err := h.Wal.Write(entry); err != nil {
-					slog.Error("CRITICAL: Failed to write to WAL", "error", err)
-					protocol.WriteResponse(conn, protocol.StatusError, "Internal server error: could not persist command", nil)
-					continue
-				}
-			}
-
-			reader = bytes.NewReader(payload)
+		// Extraemos el payload completo del comando actual de la red de forma segura.
+		// Esto evita que si hay un error de lógica, dejemos bytes basura en el stream TCP.
+		payload, err := protocol.ReadCommandPayload(conn, cmdType)
+		if err != nil {
+			slog.Error("Failed to read command payload", "error", err, "command_type", cmdType)
+			protocol.WriteResponse(conn, protocol.StatusError, "Internal server error reading command", nil)
+			continue
 		}
+
+		// Envolvemos el payload en un reader en memoria para que los handlers específicos lo consuman
+		var reader io.Reader = bytes.NewReader(payload)
 
 		if cmdType == protocol.CmdAuthenticate {
 			h.handleAuthenticate(reader, conn)
@@ -181,7 +132,7 @@ func (h *ConnectionHandler) HandleConnection(conn net.Conn) {
 		if !h.IsAuthenticated {
 			slog.Warn("Unauthorized access attempt", "remote_addr", conn.RemoteAddr().String(), "command_type", cmdType)
 			protocol.WriteResponse(conn, protocol.StatusUnauthorized, "UNAUTHORIZED: Please authenticate first.", nil)
-			io.Copy(io.Discard, reader)
+			// Al estar el payload envuelto en un bytes.NewReader, se descarta automáticamente al seguir el loop.
 			continue
 		}
 
@@ -241,7 +192,6 @@ func (h *ConnectionHandler) HandleConnection(conn net.Conn) {
 		default:
 			slog.Warn("Received unhandled command type", "command_type", cmdType, "remote_addr", conn.RemoteAddr().String())
 			protocol.WriteResponse(conn, protocol.StatusBadCommand, fmt.Sprintf("BAD COMMAND: Unhandled or unknown command type %d", cmdType), nil)
-			io.Copy(io.Discard, reader)
 		}
 	}
 }

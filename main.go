@@ -1,18 +1,14 @@
+/* ==========================================================
+   Ruta y Archivo: ./main.go
+   ========================================================== */
+
 package main
 
 import (
-	"bytes"
 	"crypto/tls"
 	"fmt"
 	"io"
 	"log/slog"
-	"lunadb/internal/config"
-	"lunadb/internal/globalconst"
-	"lunadb/internal/handler"
-	"lunadb/internal/persistence"
-	"lunadb/internal/protocol"
-	"lunadb/internal/store"
-	"lunadb/internal/wal"
 	"net"
 	"os"
 	"os/signal"
@@ -23,7 +19,13 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
+	"go.etcd.io/bbolt"
 	"go.mongodb.org/mongo-driver/bson"
+
+	"lunadb/internal/config"
+	"lunadb/internal/globalconst"
+	"lunadb/internal/handler"
+	"lunadb/internal/store"
 )
 
 var lastActivity atomic.Value
@@ -39,7 +41,7 @@ func (f updateActivityFunc) UpdateActivity() {
 }
 
 func main() {
-	// --- Configuration and Initialization ---
+	// --- 1. Configuración e Inicialización de Logs ---
 	if err := godotenv.Load(); err != nil {
 		slog.Info("No .env file found, proceeding with existing environment")
 	}
@@ -60,107 +62,44 @@ func main() {
 	multiWriter := io.MultiWriter(os.Stdout, logFile)
 	slog.SetDefault(slog.New(slog.NewJSONHandler(multiWriter, &slog.HandlerOptions{
 		AddSource: true,
-		Level:     slog.LevelError,
+		Level:     slog.LevelError, // Cambia a slog.LevelDebug para ver más detalles en desarrollo
 	})))
 	slog.Info("Logger configured successfully")
 
 	cfg := config.LoadConfig()
 
-	var walInstance *wal.WAL
-	if cfg.EnableWal {
-		if err := os.MkdirAll("data", 0755); err != nil {
-			slog.Error("Fatal: failed to create data directory for WAL", "error", err)
-			os.Exit(1)
-		}
-		walPath := filepath.Join("data", "wal.log")
-		walInstance, err = wal.New(walPath, cfg.WalFsyncInterval)
-		if err != nil {
-			slog.Error("Fatal: failed to initialize WAL", "error", err)
-			os.Exit(1)
-		}
-		defer walInstance.Close()
-		slog.Info("Write-Ahead Log (WAL) is enabled.", "path", walPath)
-	} else {
-		slog.Info("Write-Ahead Log (WAL) is disabled.")
+	// --- 2. Inicialización del Motor de Disco (Disk-First) ---
+	if err := os.MkdirAll("data", 0755); err != nil {
+		slog.Error("Fatal: failed to create data directory", "error", err)
+		os.Exit(1)
 	}
 
-	mainInMemStore := store.NewInMemStoreWithShards(cfg.NumShards)
-	collectionPersister := &persistence.CollectionPersisterImpl{}
-	collectionManager := store.NewCollectionManager(collectionPersister, cfg.NumShards)
+	dbPath := filepath.Join("data", "lunadb.db")
+	if err := store.InitDiskEngine(dbPath); err != nil {
+		slog.Error("Fatal error starting Disk Engine", "error", err)
+		os.Exit(1)
+	}
+	// Nos aseguramos de que el motor en disco se cierre correctamente al salir
+	defer store.CloseDiskEngine()
+
+	// Inicializamos nuestros administradores
+	collectionManager := store.NewCollectionManager()
+
+	// La base de datos principal (comandos SET/GET crudos) será simplemente un Bucket especial
+	mainStore := collectionManager.GetCollection("_main_store")
+
+	// Reconstruir B-Trees en RAM leyendo los Buckets del disco
+	if err := collectionManager.InitializeFromDisk(); err != nil {
+		slog.Error("Fatal error initializing collections from disk", "error", err)
+		os.Exit(1)
+	}
+
 	transactionManager := store.NewTransactionManager(collectionManager)
 	transactionManager.StartGC(5*time.Minute, 1*time.Minute)
 
-	// --- Data Loading and WAL Recovery ---
-	slog.Info("Loading data from snapshots...")
-	if err := persistence.LoadData(mainInMemStore); err != nil {
-		slog.Error("Fatal error loading main persistent data", "error", err)
-		os.Exit(1)
-	}
-	if err := persistence.LoadAllCollectionsIntoManager(collectionManager, cfg.ColdStorageMonths); err != nil {
-		slog.Error("Fatal error loading persistent collections data", "error", err)
-		os.Exit(1)
-	}
-	slog.Info("Finished loading data from snapshots.")
-
-	if walInstance != nil {
-		slog.Info("Starting WAL replay to recover most recent state...")
-		entriesChan, err := wal.Replay(walInstance.Path())
-		if err != nil {
-			slog.Error("Fatal: could not start WAL replay", "error", err)
-			os.Exit(1)
-		}
-		recoveryHandler := handler.GetConnectionHandlerFromPool(
-			nil, mainInMemStore, collectionManager, nil, transactionManager,
-			updateActivityFunc(func() {}), nil,
-		)
-		recoveryHandler.IsAuthenticated = true
-		recoveryHandler.IsRoot = true
-		replayedCount := 0
-		for entry := range entriesChan {
-			payloadReader := bytes.NewReader(entry.Payload)
-			switch entry.CommandType {
-			case protocol.CmdSet:
-				recoveryHandler.HandleMainStoreSet(payloadReader, nil)
-			case protocol.CmdCollectionCreate:
-				recoveryHandler.HandleCollectionCreate(payloadReader, nil)
-			case protocol.CmdCollectionDelete:
-				recoveryHandler.HandleCollectionDelete(payloadReader, nil)
-			case protocol.CmdCollectionIndexCreate:
-				recoveryHandler.HandleCollectionIndexCreate(payloadReader, nil)
-			case protocol.CmdCollectionIndexDelete:
-				recoveryHandler.HandleCollectionIndexDelete(payloadReader, nil)
-			case protocol.CmdCollectionItemSet:
-				recoveryHandler.HandleCollectionItemSet(payloadReader, nil)
-			case protocol.CmdCollectionItemSetMany:
-				recoveryHandler.HandleCollectionItemSetMany(payloadReader, nil)
-			case protocol.CmdCollectionItemDelete:
-				recoveryHandler.HandleCollectionItemDelete(payloadReader, nil)
-			case protocol.CmdCollectionItemDeleteMany:
-				recoveryHandler.HandleCollectionItemDeleteMany(payloadReader, nil)
-			case protocol.CmdCollectionItemUpdate:
-				recoveryHandler.HandleCollectionItemUpdate(payloadReader, nil)
-			case protocol.CmdCollectionItemUpdateMany:
-				recoveryHandler.HandleCollectionItemUpdateMany(payloadReader, nil)
-			case protocol.CmdChangeUserPassword:
-				recoveryHandler.HandleChangeUserPassword(payloadReader, nil)
-			case protocol.CmdUserCreate:
-				recoveryHandler.HandleUserCreate(payloadReader, nil)
-			case protocol.CmdUserUpdate:
-				recoveryHandler.HandleUserUpdate(payloadReader, nil)
-			case protocol.CmdUserDelete:
-				recoveryHandler.HandleUserDelete(payloadReader, nil)
-			case protocol.CmdCommit:
-				recoveryHandler.HandleCommit(payloadReader, nil)
-			case protocol.CmdRestore:
-				recoveryHandler.HandleRestore(payloadReader, nil)
-			}
-			replayedCount++
-		}
-		handler.PutConnectionHandlerToPool(recoveryHandler)
-		slog.Info("WAL replay complete.", "replayed_entries", replayedCount)
-	}
-
+	// --- 3. Creación de Usuarios por Defecto (ACID en disco directamente) ---
 	systemCollection := collectionManager.GetCollection(globalconst.SystemCollectionName)
+
 	if _, found := systemCollection.Get(globalconst.UserPrefix + "admin"); !found {
 		slog.Info("Default admin user not found, creating...", "user", "admin")
 		hashedPassword, _ := handler.HashPassword(cfg.DefaultAdminPassword)
@@ -171,9 +110,10 @@ func main() {
 			Permissions:  map[string]string{"*": globalconst.PermissionWrite, globalconst.SystemCollectionName: globalconst.PermissionRead},
 		}
 		adminUserInfoBytes, _ := bson.Marshal(adminUserInfo)
+		// Ya no necesitamos EnqueueSaveTask, el Set va directo al disco físico
 		systemCollection.Set(globalconst.UserPrefix+"admin", adminUserInfoBytes, 0)
-		collectionManager.EnqueueSaveTask(globalconst.SystemCollectionName, systemCollection)
 	}
+
 	if _, found := systemCollection.Get(globalconst.UserPrefix + "root"); !found {
 		slog.Info("Default root user not found, creating...", "user", "root")
 		hashedPassword, _ := handler.HashPassword(cfg.DefaultRootPassword)
@@ -185,10 +125,9 @@ func main() {
 		}
 		rootUserInfoBytes, _ := bson.Marshal(rootUserInfo)
 		systemCollection.Set(globalconst.UserPrefix+"root", rootUserInfoBytes, 0)
-		collectionManager.EnqueueSaveTask(globalconst.SystemCollectionName, systemCollection)
 	}
 
-	// --- Server Startup and Workers ---
+	// --- 4. Inicialización del Servidor TLS ---
 	cert, err := tls.LoadX509KeyPair("certificates/server.crt", "certificates/server.key")
 	if err != nil {
 		slog.Error("Failed to load server certificate or key", "error", err)
@@ -203,17 +142,18 @@ func main() {
 	defer listener.Close()
 	slog.Info("TLS TCP server listening securely", "port", cfg.Port)
 
-	backupManager := persistence.NewBackupManager(mainInMemStore, collectionManager, cfg.BackupInterval, cfg.BackupRetention)
-	backupManager.Start()
-	defer backupManager.Stop()
-
+	// --- 5. Worker Pool de Conexiones ---
 	jobs := make(chan net.Conn, cfg.WorkerPoolSize)
 	for w := 1; w <= cfg.WorkerPoolSize; w++ {
 		go func(id int) {
 			for conn := range jobs {
+				// Llamada corregida con exactamente los 5 argumentos requeridos
 				h := handler.GetConnectionHandlerFromPool(
-					walInstance, mainInMemStore, collectionManager, backupManager,
-					transactionManager, updateActivityFunc(func() { lastActivity.Store(time.Now()) }), conn,
+					mainStore,
+					collectionManager,
+					transactionManager,
+					updateActivityFunc(func() { lastActivity.Store(time.Now()) }),
+					conn,
 				)
 				h.HandleConnection(conn)
 				handler.PutConnectionHandlerToPool(h)
@@ -237,38 +177,10 @@ func main() {
 		}
 	}()
 
-	// --- Background Tasks ---
+	// --- 6. Tareas en Segundo Plano ---
 	shutdownChan := make(chan struct{})
 
-	// Global Checkpoint Worker
-	if cfg.EnableSnapshots {
-		go func() {
-			ticker := time.NewTicker(cfg.SnapshotInterval)
-			defer ticker.Stop()
-			slog.Info("Global Checkpoint Worker started", "interval", cfg.SnapshotInterval.String())
-			for {
-				select {
-				case <-ticker.C:
-					slog.Info("Performing global checkpoint...")
-					err1 := persistence.SaveData(mainInMemStore)
-					err2 := persistence.SaveAllCollectionsFromManager(collectionManager)
-					if err1 != nil || err2 != nil {
-						slog.Error("Error during checkpoint snapshots", "main_store_error", err1, "collections_error", err2)
-					}
-					if err1 == nil && err2 == nil && walInstance != nil {
-						if err := walInstance.Rotate(); err != nil {
-							slog.Error("CRITICAL: Failed to rotate WAL file after checkpoint", "error", err)
-						}
-					}
-				case <-shutdownChan:
-					slog.Info("Global Checkpoint Worker stopped.")
-					return
-				}
-			}
-		}()
-	}
-
-	// TTL Cleanup Worker
+	// Worker de Limpieza de TTL (Lazy Expiration asistida)
 	go func() {
 		ticker := time.NewTicker(cfg.TtlCleanInterval)
 		defer ticker.Stop()
@@ -276,7 +188,7 @@ func main() {
 		for {
 			select {
 			case <-ticker.C:
-				mainInMemStore.CleanExpiredItems()
+				// El disco barre todo y borra lo que ya expiró físicamente
 				collectionManager.CleanExpiredItemsAndSave()
 			case <-shutdownChan:
 				slog.Info("TTL cleaner stopped.")
@@ -285,56 +197,7 @@ func main() {
 		}
 	}()
 
-	if cfg.ColdStorageMonths > 0 {
-		// Cold Data Eviction Worker
-		go func() {
-			interval := time.Duration(cfg.HotStorageCleanHours) * time.Hour
-			ticker := time.NewTicker(interval)
-			defer ticker.Stop()
-			slog.Info("Starting Hot/Cold Eviction Worker", "interval", interval.String())
-			for {
-				select {
-				case <-ticker.C:
-					slog.Info("Eviction Worker starting run...")
-					evictionThreshold := time.Now().AddDate(0, -cfg.ColdStorageMonths, 0)
-					collectionManager.EvictColdData(evictionThreshold)
-					slog.Info("Eviction Worker finished run.")
-				case <-shutdownChan:
-					slog.Info("Eviction Worker stopped.")
-					return
-				}
-			}
-		}()
-
-		// Compaction Worker
-		go func() {
-			ticker := time.NewTicker(24 * time.Hour)
-			defer ticker.Stop()
-			slog.Info("Starting Compaction Worker", "interval", "24h")
-			for {
-				select {
-				case <-ticker.C:
-					slog.Info("Compaction Worker starting run...")
-					collectionNames, err := persistence.ListCollectionFiles()
-					if err != nil {
-						slog.Error("Compaction worker failed to list collection files", "error", err)
-						continue
-					}
-					for _, name := range collectionNames {
-						if err := persistence.CompactCollectionFile(name); err != nil {
-							slog.Error("Failed to compact collection file", "collection", name, "error", err)
-						}
-					}
-					slog.Info("Compaction Worker finished run.")
-				case <-shutdownChan:
-					slog.Info("Compaction Worker stopped.")
-					return
-				}
-			}
-		}()
-	}
-
-	// Idle Memory Cleanup Worker
+	// Worker para liberar memoria inactiva del SO (Relevante para el GC de Go)
 	go func() {
 		checkInterval := 2 * time.Minute
 		idleThreshold := 5 * time.Minute
@@ -356,10 +219,54 @@ func main() {
 		}
 	}()
 
-	// --- Graceful Shutdown ---
+	// Worker de Backups Automáticos Periódicos
+	go func() {
+		ticker := time.NewTicker(cfg.BackupInterval)
+		defer ticker.Stop()
+		slog.Info("Starting automated backup worker", "interval", cfg.BackupInterval.String())
+
+		for {
+			select {
+			case <-ticker.C:
+				backupDir := "backups"
+				os.MkdirAll(backupDir, 0755)
+				fileName := fmt.Sprintf("lunadb_auto_%s.db", time.Now().Format("20060102_150405"))
+				backupPath := filepath.Join(backupDir, fileName)
+
+				file, err := os.Create(backupPath)
+				if err == nil {
+					store.GlobalDB.View(func(tx *bbolt.Tx) error {
+						_, err := tx.WriteTo(file)
+						return err
+					})
+					file.Close()
+					slog.Info("Automated backup completed successfully", "file", fileName)
+				} else {
+					slog.Error("Failed to create automated backup file", "error", err)
+				}
+
+				// Limpieza de backups viejos
+				cutoffTime := time.Now().Add(-cfg.BackupRetention)
+				if entries, err := os.ReadDir(backupDir); err == nil {
+					for _, entry := range entries {
+						if info, err := entry.Info(); err == nil && info.ModTime().Before(cutoffTime) {
+							os.Remove(filepath.Join(backupDir, entry.Name()))
+							slog.Info("Old backup deleted", "file", entry.Name())
+						}
+					}
+				}
+
+			case <-shutdownChan:
+				slog.Info("Automated backup worker stopped.")
+				return
+			}
+		}
+	}()
+
+	// --- 7. Graceful Shutdown ---
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	fmt.Println("🚀 ¡LunaDB core engine initialized. The sharded in-memory store is fully operational and ready to accept connections!")
+	fmt.Println("🚀 ¡LunaDB Disk-First Engine initialized. ACID-compliant and ready to accept connections!")
 	<-sigChan
 
 	slog.Info("Termination signal received. Starting graceful shutdown...")
@@ -372,15 +279,6 @@ func main() {
 
 	close(shutdownChan)
 	transactionManager.StopGC()
-	collectionManager.Wait()
 
-	slog.Info("Saving final data before application exit...")
-	if err := persistence.SaveData(mainInMemStore); err != nil {
-		slog.Error("Error saving final main store data during shutdown", "error", err)
-	}
-	if err := persistence.SaveAllCollectionsFromManager(collectionManager); err != nil {
-		slog.Error("Error saving final collections data during shutdown", "error", err)
-	}
-
-	slog.Info("Final data saved. Application exiting.")
+	slog.Info("Application exiting cleanly.")
 }

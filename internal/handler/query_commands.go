@@ -1,3 +1,7 @@
+/* ==========================================================
+   Ruta y Archivo: ./internal/handler/query_commands.go
+   ========================================================== */
+
 package handler
 
 import (
@@ -5,10 +9,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"lunadb/internal/globalconst"
-	"lunadb/internal/persistence"
-	"lunadb/internal/protocol"
-	"lunadb/internal/store"
 	"math"
 	"net"
 	"regexp"
@@ -20,6 +20,10 @@ import (
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/bsontype"
+
+	"lunadb/internal/globalconst"
+	"lunadb/internal/protocol"
+	"lunadb/internal/store"
 )
 
 var regexCache sync.Map
@@ -134,7 +138,7 @@ func (h *ConnectionHandler) processCollectionQuery(collectionName string, query 
 	}
 
 	// =====================================================================
-	// 2. EJECUCIÓN NORMAL (Carga de datos)
+	// 2. EJECUCIÓN NORMAL (Carga de datos transaccional desde disco/bbolt)
 	// =====================================================================
 
 	isSimpleQuery := len(query.Filter) == 0 && len(query.OrderBy) == 0 &&
@@ -157,6 +161,7 @@ func (h *ConnectionHandler) processCollectionQuery(collectionName string, query 
 				processedCount++
 				return true
 			}
+			// En DiskStore, 'value' es una copia segura, podemos referenciarla en bson.Raw
 			rawResults = append(rawResults, bson.Raw(value))
 			if limit != -1 && len(rawResults) >= limit {
 				return false
@@ -190,7 +195,6 @@ func (h *ConnectionHandler) processCollectionQuery(collectionName string, query 
 			matchCount := 0
 
 			if len(query.Filter) == 0 {
-				// ✅ MAGIA DE DEEP PAGINATION: Saltamos el OFFSET sin abrir el BSON!
 				colStore.StreamByIndex(orderField, isDesc, func(key string) bool {
 					matchCount++
 					if matchCount > offset {
@@ -203,15 +207,13 @@ func (h *ConnectionHandler) processCollectionQuery(collectionName string, query 
 					}
 					return true
 				})
-				// Comprobamos si logramos llenar el límite
 				if limit != -1 && len(paginatedRaw) == limit {
 					usedFastPath = true
 					slog.Debug("Query optimizer: used B-Tree Fast Path for DEEP PAGINATION")
 				} else if limit == -1 {
-					usedFastPath = true // Si no hay límite y escaneó todo, es válido
+					usedFastPath = true
 				}
 			} else {
-				// Con filtro, escaneamos y evaluamos BSON al vuelo
 				compiledEvaluator := h.compileFilter(query.Filter)
 				colStore.StreamByIndex(orderField, isDesc, func(key string) bool {
 					if vBytes, found := colStore.Get(key); found {
@@ -232,7 +234,7 @@ func (h *ConnectionHandler) processCollectionQuery(collectionName string, query 
 					usedFastPath = true
 					slog.Debug("Query optimizer: used B-Tree Fast Path for ORDER BY + LIMIT + FILTER")
 				} else {
-					paginatedRaw = nil // Fallback si requiere disco (datos fríos)
+					paginatedRaw = nil
 				}
 			}
 		}
@@ -245,27 +247,20 @@ func (h *ConnectionHandler) processCollectionQuery(collectionName string, query 
 		var usedIndex bool
 		var remainingFilter map[string]any
 
-		// 🚀 HEURÍSTICA INTELIGENTE DEL OPTIMIZADOR:
-		// Si hay un 'OR' y nos piden pocos resultados (LIMIT), es matemáticamente más rápido
-		// hacer un Full Scan con detención instantánea que unir cientos de miles de llaves de índices.
 		_, hasOr := query.Filter[globalconst.OpOr]
 
 		if canShortCircuit && hasOr {
-			usedIndex = false // Forzamos a no usar el índice. ¡Dejamos que StreamAll haga la magia!
+			usedIndex = false
 			remainingFilter = query.Filter
 		} else {
-			// Comportamiento normal usando los B-Trees
 			candidateKeys, usedIndex, remainingFilter = h.findCandidateKeysFromFilter(colStore, query.Filter)
 		}
 
 		compiledEvaluator := h.compileFilter(remainingFilter)
-		hotFoundIDs := make(map[string]struct{})
 
 		if usedIndex {
 			numKeys := len(candidateKeys)
 
-			// Si podemos hacer cortocircuito, NO usamos workers. Un bucle secuencial
-			// nos permite frenar en nanosegundos al llegar al límite.
 			if numKeys > 1000 && !canShortCircuit {
 				numWorkers := 4
 				chunkSize := (numKeys + numWorkers - 1) / numWorkers
@@ -288,14 +283,12 @@ func (h *ConnectionHandler) processCollectionQuery(collectionName string, query 
 					go func(keysChunk []string) {
 						defer wg.Done()
 						localResults := make([]bson.Raw, 0, len(keysChunk)/2)
-						localIDs := make(map[string]struct{})
 
 						for _, k := range keysChunk {
 							if vBytes, found := colStore.Get(k); found {
 								rawDoc := bson.Raw(vBytes)
 								if compiledEvaluator(rawDoc) {
 									localResults = append(localResults, rawDoc)
-									localIDs[k] = struct{}{}
 								}
 							}
 						}
@@ -303,16 +296,12 @@ func (h *ConnectionHandler) processCollectionQuery(collectionName string, query 
 						if len(localResults) > 0 {
 							mu.Lock()
 							finalRawResults = append(finalRawResults, localResults...)
-							for k := range localIDs {
-								hotFoundIDs[k] = struct{}{}
-							}
 							mu.Unlock()
 						}
 					}(candidateKeys[start:end])
 				}
 				wg.Wait()
 			} else {
-				// MODO RÁPIDO SECUENCIAL: Evalúa y se detiene
 				capacity := 1024
 				if canShortCircuit {
 					capacity = limitTarget
@@ -324,9 +313,7 @@ func (h *ConnectionHandler) processCollectionQuery(collectionName string, query 
 						rawDoc := bson.Raw(vBytes)
 						if compiledEvaluator(rawDoc) {
 							finalRawResults = append(finalRawResults, rawDoc)
-							hotFoundIDs[k] = struct{}{}
 
-							// ¡AQUÍ ESTÁ LA MAGIA! Detención instantánea.
 							if canShortCircuit && len(finalRawResults) >= limitTarget {
 								break
 							}
@@ -345,42 +332,13 @@ func (h *ConnectionHandler) processCollectionQuery(collectionName string, query 
 				rawDoc := bson.Raw(vBytes)
 				if compiledEvaluator(rawDoc) {
 					finalRawResults = append(finalRawResults, rawDoc)
-					hotFoundIDs[k] = struct{}{}
 
 					if canShortCircuit && len(finalRawResults) >= limitTarget {
-						return false // Short circuit en Full Scan
+						return false
 					}
 				}
 				return true
 			})
-		}
-
-		shouldSkipColdSearch := false
-		if query.Limit != nil && len(finalRawResults) >= (*query.Limit+query.Offset) && len(query.OrderBy) == 0 && len(query.Aggregations) == 0 && len(query.GroupBy) == 0 {
-			shouldSkipColdSearch = true
-		}
-
-		if !shouldSkipColdSearch {
-			compiledEvaluatorForCold := h.compileFilter(query.Filter)
-			coldMatcher := func(itemBSON []byte) bool {
-				rawDoc := bson.Raw(itemBSON)
-				if idVal, err := rawDoc.LookupErr(globalconst.ID); err == nil {
-					if idStr, strOk := idVal.StringValueOK(); strOk {
-						if _, existsInHot := hotFoundIDs[idStr]; existsInHot {
-							return false
-						}
-					}
-				}
-				return compiledEvaluatorForCold(rawDoc)
-			}
-			coldResults, err := persistence.SearchColdData(collectionName, coldMatcher)
-			if err == nil {
-				for _, res := range coldResults {
-					if b, mErr := bson.Marshal(res); mErr == nil {
-						finalRawResults = append(finalRawResults, bson.Raw(b))
-					}
-				}
-			}
 		}
 
 		if query.Distinct != "" {
@@ -474,7 +432,7 @@ func (h *ConnectionHandler) processCollectionQuery(collectionName string, query 
 		}
 	}
 
-	// --- OPTIMIZACIÓN LETAL v4: ZERO-COPY CACHED JOIN ---
+	// --- ZERO-COPY CACHED JOIN ---
 	if len(query.Lookups) > 0 {
 		for _, lookupSpec := range query.Lookups {
 			foreignColStore := h.CollectionManager.GetCollection(lookupSpec.FromCollection)
@@ -487,11 +445,7 @@ func (h *ConnectionHandler) processCollectionQuery(collectionName string, query 
 				continue
 			}
 
-			// Caché local para evitar golpear el B-Tree y los RWMutex si varios documentos
-			// comparten la misma llave foránea (ej. miles de empleados en el mismo departamento).
 			localCache := make(map[any]any)
-
-			// Optimización: Evitar la sobrecarga de strings.Split si la llave local es plana (sin puntos).
 			isFlatKey := !strings.Contains(lookupSpec.LocalField, ".")
 
 			for i := range finalDocs {
@@ -505,40 +459,29 @@ func (h *ConnectionHandler) processCollectionQuery(collectionName string, query 
 				}
 
 				if ok && localVal != nil {
-					// Nos aseguramos que localVal sea una llave segura para el mapa de caché
 					var cacheKey any
 					switch v := localVal.(type) {
 					case string, int, int32, int64, float64, float32, bool:
 						cacheKey = v
 					default:
-						cacheKey = fmt.Sprintf("%v", v) // Fallback seguro para slices o arrays
+						cacheKey = fmt.Sprintf("%v", v)
 					}
 
-					// 1. Búsqueda instantánea en Caché L1 (O(1) puro sin locks de Shard)
 					if cachedDoc, exists := localCache[cacheKey]; exists {
 						finalDocs[i][lookupSpec.As] = cachedDoc
 						continue
 					}
 
-					// 2. Si no está en caché, buscamos en el índice foráneo
 					if keys, found := foreignColStore.Lookup(lookupSpec.ForeignField, localVal); found && len(keys) > 0 {
 						if fBytes, existsInForeign := foreignColStore.Get(keys[0]); existsInForeign {
-
-							// 🔥 MAGIA ZERO-COPY:
-							// En lugar de hacer un pesado bson.Unmarshal, envolvemos los bytes crudos.
-							// El paquete bson integrará estos bytes directamente en el JSON/BSON de respuesta.
 							rawForeign := bson.Raw(fBytes)
-
 							finalDocs[i][lookupSpec.As] = rawForeign
 							localCache[cacheKey] = rawForeign
 							continue
 						}
 					}
-					// Guardamos el "no encontrado" en caché para no volver a buscarlo
 					localCache[cacheKey] = nil
 				}
-
-				// Si falla la extracción o no hubo coincidencia, seteamos a nil
 				finalDocs[i][lookupSpec.As] = nil
 			}
 		}
@@ -574,7 +517,7 @@ func (h *ConnectionHandler) sortResults(results []bson.M, orderBy []OrderByClaus
 			}
 			if !okA {
 				return true
-			} // Nulos al final
+			}
 			if !okB {
 				return false
 			}
@@ -600,13 +543,7 @@ type ResultHeap struct {
 
 func (h *ResultHeap) Len() int      { return len(h.items) }
 func (h *ResultHeap) Swap(i, j int) { h.items[i], h.items[j] = h.items[j], h.items[i] }
-
-// Push añade un elemento.
-func (h *ResultHeap) Push(x any) {
-	h.items = append(h.items, x.(bson.M))
-}
-
-// Pop elimina el último elemento.
+func (h *ResultHeap) Push(x any)    { h.items = append(h.items, x.(bson.M)) }
 func (h *ResultHeap) Pop() any {
 	old := h.items
 	n := len(old)
@@ -614,13 +551,8 @@ func (h *ResultHeap) Pop() any {
 	h.items = old[0 : n-1]
 	return item
 }
+func (h *ResultHeap) Less(i, j int) bool { return !h.LessItem(h.items[i], h.items[j]) }
 
-// Less define el orden del Heap.
-func (h *ResultHeap) Less(i, j int) bool {
-	return !h.LessItem(h.items[i], h.items[j])
-}
-
-// LessItem implementa la lógica de comparación pura basada en OrderBy.
 func (h *ResultHeap) LessItem(a, b bson.M) bool {
 	for _, ob := range h.orderBy {
 		valA, okA := getNestedValue(a, ob.Field)
@@ -649,26 +581,23 @@ func (h *ResultHeap) LessItem(a, b bson.M) bool {
 
 // --- OPTIMIZADOR DE QUERIES (Index Selection) ---
 
-// findCandidateKeysFromFilter evalúa recursivamente el filtro y retorna las claves (IDs) que coinciden
-// utilizando múltiples índices de manera agresiva (Index Merge e Intersección).
 func (h *ConnectionHandler) findCandidateKeysFromFilter(colStore store.DataStore, filter map[string]any) (keys []string, usedIndex bool, remainingFilter map[string]any) {
 	if len(filter) == 0 {
 		return nil, false, filter
 	}
 
-	// 1. Manejo de OR (Unión de Índices)
 	if orRaw, exists := filter[globalconst.OpOr]; exists {
 		var orConditions []any
 		if ba, ok := orRaw.(bson.A); ok {
 			orConditions = ba
 		} else if arr, ok := orRaw.([]any); ok {
-			orConditions = arr // Soportamos []any enviado directamente desde el cliente
+			orConditions = arr
 		}
 
 		if len(orConditions) > 0 {
 			unionKeys := make(map[string]struct{})
 			allConditionsAreIndexable := true
-			hasAnyRemainingFilter := false // Rastreamos si debemos re-evaluar el OR
+			hasAnyRemainingFilter := false
 
 			for _, cond := range orConditions {
 				condMap, isMap := asMap(cond)
@@ -679,7 +608,7 @@ func (h *ConnectionHandler) findCandidateKeysFromFilter(colStore store.DataStore
 				subKeys, subIndexUsed, subRemainingFilter := h.findCandidateKeysFromFilter(colStore, condMap)
 				if !subIndexUsed {
 					allConditionsAreIndexable = false
-					break // Si UNA condición no tiene índice, el OR completo debe hacer Full Scan
+					break
 				}
 				if len(subRemainingFilter) > 0 {
 					hasAnyRemainingFilter = true
@@ -696,7 +625,6 @@ func (h *ConnectionHandler) findCandidateKeysFromFilter(colStore store.DataStore
 				}
 				slog.Debug("Query optimizer: using Index Merge for 'OR' clause", "found_keys", len(finalKeys))
 
-				// Si alguna sub-condición dejó residuos, devolvemos el OR completo para verificación
 				var finalRemainingFilter map[string]any
 				if hasAnyRemainingFilter {
 					finalRemainingFilter = filter
@@ -708,13 +636,12 @@ func (h *ConnectionHandler) findCandidateKeysFromFilter(colStore store.DataStore
 		}
 	}
 
-	// 2. Manejo de AND (INTERSECCIÓN DE ÍNDICES)
 	if andRaw, exists := filter[globalconst.OpAnd]; exists {
 		var andConditions []any
 		if ba, ok := andRaw.(bson.A); ok {
 			andConditions = ba
 		} else if arr, ok := andRaw.([]any); ok {
-			andConditions = arr // Soportamos []any
+			andConditions = arr
 		}
 
 		if len(andConditions) > 0 {
@@ -777,7 +704,6 @@ func (h *ConnectionHandler) findCandidateKeysFromFilter(colStore store.DataStore
 		}
 	}
 
-	// 3. Manejo de Operaciones Simples (Base case)
 	field, fieldOk := filter["field"].(string)
 	op, opOk := filter["op"].(string)
 	value := filter["value"]
@@ -821,12 +747,9 @@ func (h *ConnectionHandler) findCandidateKeysFromFilter(colStore store.DataStore
 			}
 		case globalconst.OpLike:
 			if strVal, isStr := value.(string); isStr {
-				// Optimización brutal: Si es un LIKE de prefijo puro ("Algo%"), usamos el B-Tree
 				if strings.HasSuffix(strVal, "%") && !strings.HasPrefix(strVal, "%") {
 					prefix := strVal[:len(strVal)-1]
-					// Verificamos que no haya otros '%' en el medio de la palabra
 					if !strings.Contains(prefix, "%") {
-						// Magia del Range Scan: Buscamos desde 'prefix' hasta 'prefix' + el byte máximo (\xff)
 						highBound := prefix + "\xff"
 						keys, used = colStore.LookupRange(field, prefix, highBound, true, true)
 					}
@@ -843,8 +766,6 @@ func (h *ConnectionHandler) findCandidateKeysFromFilter(colStore store.DataStore
 	return nil, false, filter
 }
 
-// compileFilter toma un mapa de condiciones (ej. el WHERE) y retorna una función evaluadora
-// pre-computada y fuertemente tipada para ejecutar a máxima velocidad.
 func (h *ConnectionHandler) compileFilter(filter map[string]any) func(bson.Raw) bool {
 	if len(filter) == 0 {
 		return func(bson.Raw) bool { return true }
@@ -906,7 +827,6 @@ func (h *ConnectionHandler) compileFilter(filter map[string]any) func(bson.Raw) 
 
 	keys := strings.Split(field, ".")
 
-	// Optimizaciones específicas por operador
 	switch op {
 	case globalconst.OpEqual:
 		return func(doc bson.Raw) bool {
@@ -969,19 +889,16 @@ func (h *ConnectionHandler) compileFilter(filter map[string]any) func(bson.Raw) 
 		}
 	}
 
-	// Fallback para otros operadores usando la lógica clásica
 	return func(doc bson.Raw) bool {
-		return h.matchFilter(doc, filter) // Fallback seguro
+		return h.matchFilter(doc, filter)
 	}
 }
 
-// matchFilter evalúa un item JSON/BSON CRUDO ([]byte) contra una condición de filtro (Zero-Allocation).
 func (h *ConnectionHandler) matchFilter(itemBSON []byte, filter map[string]any) bool {
 	if len(filter) == 0 {
 		return true
 	}
 
-	// Manejo seguro de AND (Soporta sintaxis JSON cruda y BSON)
 	if andRaw, exists := filter[globalconst.OpAnd]; exists {
 		var andConditions []any
 		if ba, ok := andRaw.(bson.A); ok {
@@ -1001,7 +918,6 @@ func (h *ConnectionHandler) matchFilter(itemBSON []byte, filter map[string]any) 
 		}
 	}
 
-	// Manejo seguro de OR
 	if orRaw, exists := filter[globalconst.OpOr]; exists {
 		var orConditions []any
 		if ba, ok := orRaw.(bson.A); ok {
@@ -1021,7 +937,6 @@ func (h *ConnectionHandler) matchFilter(itemBSON []byte, filter map[string]any) 
 		}
 	}
 
-	// Manejo seguro de NOT
 	if notRaw, exists := filter[globalconst.OpNot]; exists {
 		notCondition, isM := asMap(notRaw)
 		if isM && notCondition != nil {
@@ -1139,7 +1054,6 @@ func (h *ConnectionHandler) matchFilter(itemBSON []byte, filter map[string]any) 
 	}
 }
 
-// compare compara dos valores any de forma segura, ahora soporta time.Time nativo.
 func compare(a, b any) int {
 	if tA, okA := a.(time.Time); okA {
 		if tB, okB := b.(time.Time); okB {
@@ -1181,7 +1095,6 @@ func compare(a, b any) int {
 	return strings.Compare(strA, strB)
 }
 
-// toFloat64 convierte any a float64.
 func toFloat64(val any) (float64, bool) {
 	switch v := val.(type) {
 	case int:
@@ -1206,7 +1119,6 @@ func toFloat64(val any) (float64, bool) {
 	}
 }
 
-// performAggregations maneja GROUP BY y funciones de agregación (SUM, AVG, MIN, MAX, COUNT).
 func (h *ConnectionHandler) performAggregations(items []struct {
 	Key string
 	Val bson.M
@@ -1344,7 +1256,6 @@ func max(a, b int) int {
 	return int(math.Max(float64(a), float64(b)))
 }
 
-// intersectKeys calcula la intersección de múltiples slices de claves optimizado.
 func intersectKeys(keySets [][]string) []string {
 	if len(keySets) == 0 {
 		return []string{}
@@ -1380,7 +1291,6 @@ func intersectKeys(keySets [][]string) []string {
 	return finalKeys
 }
 
-// getNestedValue recupera un valor de un mapa anidado soportando bson.M y bson.A.
 func getNestedValue(data map[string]any, path string) (any, bool) {
 	parts := strings.Split(path, ".")
 	var current any = data
@@ -1411,7 +1321,6 @@ func getNestedValue(data map[string]any, path string) (any, bool) {
 	return current, true
 }
 
-// setNestedValue establece un valor en un mapa anidado usando una ruta separada por puntos.
 func setNestedValue(data map[string]any, path string, value any) {
 	parts := strings.Split(path, ".")
 	currentMap := data
@@ -1440,7 +1349,6 @@ func setNestedValue(data map[string]any, path string, value any) {
 
 // --- ZERO-COPY HELPERS ---
 
-// getRawValue lee un campo directamente del binario BSON sin alojar memoria.
 func getRawValue(doc bson.Raw, path string) (any, bool) {
 	val, err := doc.LookupErr(strings.Split(path, ".")...)
 	if err != nil || val.Type == bsontype.Null {
@@ -1464,7 +1372,6 @@ func getRawValue(doc bson.Raw, path string) (any, bool) {
 	}
 }
 
-// getRawValueByParsedPath es idéntica a getRawValue, pero evita el strings.Split en cada iteración
 func getRawValueByParsedPath(doc bson.Raw, keys []string) (any, bool) {
 	val, err := doc.LookupErr(keys...)
 	if err != nil || val.Type == bsontype.Null {
@@ -1488,14 +1395,11 @@ func getRawValueByParsedPath(doc bson.Raw, keys []string) (any, bool) {
 	}
 }
 
-// SortItem es una estructura ligera que contiene el documento en bruto y
-// los valores pre-extraídos de los campos por los que queremos ordenar.
 type SortItem struct {
 	Raw    bson.Raw
-	Values []any // Pre-calculated values for sorting
+	Values []any
 }
 
-// RawResultHeap es un montículo (Heap) optimizado que usa la Transformada de Schwartz
 type RawResultHeap struct {
 	items   []SortItem
 	orderBy []OrderByClause
@@ -1513,7 +1417,6 @@ func (h *RawResultHeap) Pop() any {
 }
 func (h *RawResultHeap) Less(i, j int) bool { return !h.LessItem(h.items[i], h.items[j]) }
 
-// LessItem ahora compara valores pre-extraídos. ¡Adiós parseo BSON constante!
 func (h *RawResultHeap) LessItem(a, b SortItem) bool {
 	for idx, ob := range h.orderBy {
 		valA := a.Values[idx]
@@ -1524,7 +1427,7 @@ func (h *RawResultHeap) LessItem(a, b SortItem) bool {
 		}
 		if valA == nil {
 			return true
-		} // Nulos al final
+		}
 		if valB == nil {
 			return false
 		}
@@ -1540,7 +1443,6 @@ func (h *RawResultHeap) LessItem(a, b SortItem) bool {
 	return false
 }
 
-// sortRawResults ordena la lista completa usando la Transformada de Schwartz
 func sortRawResults(results []SortItem, orderBy []OrderByClause) {
 	sort.Slice(results, func(i, j int) bool {
 		for idx, ob := range orderBy {
@@ -1569,7 +1471,6 @@ func sortRawResults(results []SortItem, orderBy []OrderByClause) {
 	})
 }
 
-// extractBsonRawValue convierte instantáneamente un valor BSON crudo a tipo nativo
 func extractBsonRawValue(val bson.RawValue) any {
 	switch val.Type {
 	case bsontype.Double:
@@ -1577,7 +1478,7 @@ func extractBsonRawValue(val bson.RawValue) any {
 	case bsontype.String:
 		return val.StringValue()
 	case bsontype.Int32:
-		return int64(val.Int32()) // Normalizamos a int64
+		return int64(val.Int32())
 	case bsontype.Int64:
 		return val.Int64()
 	case bsontype.Boolean:
@@ -1603,12 +1504,10 @@ type aggAccumulator struct {
 	Sums        []float64
 	Mins        []float64
 	Maxs        []float64
-	Counts      []int // Para contar campos específicos no nulos (ej: count(salary))
+	Counts      []int
 	HasVal      []bool
 }
 
-// performRawAggregations ejecuta GROUP BY y agregaciones complejas (SUM, AVG, MIN, MAX)
-// usando Single-Pass Streaming. ¡Cero clonación de documentos!
 func (h *ConnectionHandler) performRawAggregations(items []bson.Raw, query *Query) (any, error) {
 	var ops []aggOp
 	for alias, agg := range query.Aggregations {
@@ -1627,11 +1526,9 @@ func (h *ConnectionHandler) performRawAggregations(items []bson.Raw, query *Quer
 	groups := make(map[string]*aggAccumulator)
 	keyBuffer := make([]byte, 0, 128)
 
-	// 2. Pasada ÚNICA: Bucle de Alto Rendimiento (Zero Allocations)
 	for _, item := range items {
-		keyBuffer = keyBuffer[:0] // Resetea el buffer sin perder capacidad
+		keyBuffer = keyBuffer[:0]
 
-		// --- 1. CONSTRUIR LLAVE DE GRUPO CON BYTES PUROS ---
 		if len(query.GroupBy) == 0 {
 			keyBuffer = append(keyBuffer, "_no_group_"...)
 		} else {
@@ -1639,21 +1536,18 @@ func (h *ConnectionHandler) performRawAggregations(items []bson.Raw, query *Quer
 				if i > 0 {
 					keyBuffer = append(keyBuffer, '|')
 				}
-				// LookupErr no asigna memoria, devuelve referencias a los bytes
 				val, err := item.LookupErr(parsedGroupPaths[i]...)
 				if err == nil && val.Type != bsontype.Null {
-					keyBuffer = append(keyBuffer, byte(val.Type)) // Evitar colisiones (ej. int vs string)
-					keyBuffer = append(keyBuffer, val.Value...)   // ¡Añadimos los bytes binarios crudos!
+					keyBuffer = append(keyBuffer, byte(val.Type))
+					keyBuffer = append(keyBuffer, val.Value...)
 				} else {
-					keyBuffer = append(keyBuffer, 0) // Byte nulo para NULL
+					keyBuffer = append(keyBuffer, 0)
 				}
 			}
 		}
 
-		// Magia de Go: string(keyBuffer) en un mapa NO asigna memoria
 		acc, exists := groups[string(keyBuffer)]
 
-		// --- RUTA LENTA: Solo entramos aquí si el grupo es NUEVO (~40 veces en un millón) ---
 		if !exists {
 			groupStrKey := string(keyBuffer)
 			groupVals := make([]any, len(query.GroupBy))
@@ -1662,7 +1556,6 @@ func (h *ConnectionHandler) performRawAggregations(items []bson.Raw, query *Quer
 				for i := range query.GroupBy {
 					val, err := item.LookupErr(parsedGroupPaths[i]...)
 					if err == nil && val.Type != bsontype.Null {
-						// Extraemos el valor real solo 1 vez por grupo para el JSON final
 						groupVals[i] = extractBsonRawValue(val)
 					}
 				}
@@ -1681,7 +1574,6 @@ func (h *ConnectionHandler) performRawAggregations(items []bson.Raw, query *Quer
 
 		acc.Count++
 
-		// --- 2. MATEMÁTICAS DIRECTAS SIN INTERFACES ---
 		for i, op := range ops {
 			if op.Field == "*" {
 				if op.Func == globalconst.AggCount {
@@ -1700,7 +1592,6 @@ func (h *ConnectionHandler) performRawAggregations(items []bson.Raw, query *Quer
 				continue
 			}
 
-			// Extracción directa de números sin pasar por 'any'
 			var num float64
 			isNum := true
 			switch val.Type {
@@ -1735,7 +1626,6 @@ func (h *ConnectionHandler) performRawAggregations(items []bson.Raw, query *Quer
 		}
 	}
 
-	// 3. Proyectar resultados finales
 	var aggregatedResults []bson.M
 	for groupKey, acc := range groups {
 		resultRow := make(bson.M)
@@ -1792,8 +1682,6 @@ func (h *ConnectionHandler) performRawAggregations(items []bson.Raw, query *Quer
 	return aggregatedResults, nil
 }
 
-// asMap normaliza de forma segura interfaces BSON a map[string]any (bson.M),
-// soportando bson.D que es como MongoDB deserializa arreglos de objetos por defecto.
 func asMap(val any) (bson.M, bool) {
 	if m, ok := val.(bson.M); ok {
 		return m, true
