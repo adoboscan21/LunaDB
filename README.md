@@ -1,35 +1,32 @@
-# LunaDB 🚀
 
-**LunaDB** is a high-performance, sharded in-memory key-value and document store designed for speed, security, and scalability. It provides a robust backend for your applications, supporting flexible data organization through collections, persistent indexing, a powerful query engine, and a granular user permission system, all secured over a TLS-encrypted protocol.
+# LunaDB 🐈
+
+**LunaDB** is a high-performance, disk-first document and key-value database designed for extreme concurrency, unbreakable durability, and sub-millisecond query speeds. Built in Go, it seamlessly blends the flexibility of a NoSQL document store with the ACID guarantees and structured querying capabilities of a traditional relational database, all secured over a TLS-encrypted protocol.
 
 ---
 
-## ✨ Features
+## ✨ Key Architecture & Features
 
-- 🚀 **High-Performance Concurrent Architecture:** At its core, LunaDB uses an efficient **sharding design** to distribute data and minimize lock contention, allowing for massive concurrency. Client write operations are lightning-fast as the persistence to disk is handled by an **asynchronous queue**.
-- 📦 **ACID-Compliant Transactions:** Go beyond simple atomic operations with full transactional guarantees. LunaDB supports `BEGIN`, `COMMIT`, and `ROLLBACK` commands, using an internal **Two-Phase Commit (2PC) protocol** across its data shards. This ensures that complex, multi-key operations are truly **atomic**—they either all succeed or none do, maintaining perfect data integrity. An automatic **garbage collector** cleans up abandoned transactions to prevent deadlocks.
-- 💾 **Unbreakable Durability & Persistence:** Your data is safe, always.
-  - **Write-Ahead Log (WAL):** For maximum durability, every write command is first recorded in a high-speed WAL _before_ being applied to memory. In the event of a crash, the server replays the log to recover to its exact state, ensuring **zero data loss** for acknowledged writes.
-  - **Atomic Snapshots:** The server periodically takes **checkpoints** of all in-memory data, saving it to disk in an optimized binary format. The use of the **write-to-`.tmp`-and-rename strategy** ensures that snapshot files are never corrupted. Successful snapshots allow the WAL to be safely rotated.
-- 🧠 **Hot/Cold Data Tiering:** Manage datasets far larger than the available RAM. LunaDB keeps recent ("hot") data in memory for maximum speed, while older ("cold") data resides on disk. Query and modification operations **transparently access both tiers**, and cold data can be updated on-disk without needing to be loaded into memory.
-- 🛡️ **Automated Backup & Restore System:** Go beyond simple persistence with a full-featured backup system. It performs **periodic, verifiable backups** to timestamped directories, manages a **retention policy** to clean up old files, and allows for a full manual **restore** from any backup point.
-- 📈 **High-Performance B-Tree Indexing:** Drastically accelerate query performance by creating indexes on any field. Unlike simple hash maps, the use of **B-Trees** enables extremely fast **range scans (`>`, `<`, `between`)** in addition to equality lookups, avoiding costly full-collection scans.
-- 🔍 **Advanced SQL-like Query Engine:** Query your JSON documents with the power and flexibility of a relational database. The engine is backed by a **query optimizer** that intelligently leverages available indexes to execute commands in the most efficient way possible. It supports:
-  - **Rich Filtering**: `WHERE`, `AND`, `OR`, `NOT`, `LIKE`, `IN`, `BETWEEN`, `IS NULL`.
-  - **Powerful Aggregations**: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` with `GROUP BY`.
-  - **Post-Aggregation Filtering**: A full `HAVING` clause to filter your grouped results.
+- 💾 **Disk-First ACID Persistence:** Powered by a robust B+Tree storage engine (`bbolt`), LunaDB ensures that acknowledged writes are instantly and safely synced to disk. No data loss, no volatile memory limits—your database is fully ACID compliant by default.
+- ⚡ **Massive Concurrency via Group Commit:** To solve the traditional disk I/O bottleneck, LunaDB implements an advanced **WriteBatcher**. It intelligently queues and merges thousands of concurrent micro-transactions into a single, atomic physical disk write. This allows the engine to handle massive traffic spikes (like thousands of concurrent ERP transactions) with ease.
+- 🧠 **Hybrid B-Tree Indexing:** LunaDB keeps the actual payload safely on disk while maintaining lightning-fast **B-Tree indexes in RAM**. This architecture allows for microsecond equality lookups, deep pagination (`OFFSET`/`LIMIT`), and range scans (`>`, `<`, `BETWEEN`) without touching the disk until the exact documents are identified.
+- 🐈 **Zero-Copy BSON Engine:** Data is streamed and patched at the byte level. LunaDB reads binary BSON directly from the memory-mapped file and evaluates queries or sends data over the network with minimal reflection or struct unmarshalling, drastically reducing Go's Garbage Collection (GC) overhead.
+- 📦 **Stateful Transactions:** Go beyond simple atomic operations. LunaDB supports `BEGIN`, `COMMIT`, and `ROLLBACK` commands. Complex, multi-document mutations are queued in memory and executed atomically, ensuring perfect data integrity across collections. 
+- 🛡️ **Hot Backups & Restores:** Perform full database snapshots (`backup`) or logical wipe-and-restores (`restore`) directly from the CLI without locking the database or stopping the world.
+- 🔍 **Advanced SQL-like Query Optimizer:** Query your flexible JSON/BSON documents with a powerful, index-aware execution engine. It supports:
+  - **Rich Filtering**: `AND`, `OR`, `NOT`, `LIKE` (Regex-backed), `IN`, `BETWEEN`, `IS NULL`.
+  - **Streaming Aggregations**: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` with `GROUP BY` calculated on-the-fly without blowing up RAM.
+  - **Post-Aggregation Filtering**: A full `HAVING` clause.
   - **Data Shaping**: `ORDER BY`, `LIMIT`, `OFFSET`, `DISTINCT`, and field `Projection`.
-  - **Cross-Collection Joins**: A powerful `lookups` pipeline to join documents from different collections.
-- ⚡ **Efficient Batch Operations:** Execute commands on multiple items at once for greater efficiency. `set many`, `update many`, and `delete many` commands are fully supported and optimized to work with transactions and both hot and cold data tiers.
-- 🔐 **Full Security Suite:** Security is built-in, not an afterthought.
-  - **TLS Encryption:** All communication is encrypted with TLS 1.2+, protecting data in transit.
-  - **Strong Authentication:** Passwords are never stored in plain text, using `bcrypt` hashing.
-  - **Granular Permissions:** A robust user management system allows for creating users and assigning specific `read`/`write` permissions per collection.
-  - **Restricted Superuser**: The `root` user is restricted to **localhost connections only**.
-- 🧹 **Automatic Data & Memory Management:** The engine works for you in the background.
-  - **TTL (Time-to-Live):** Assign a time-to-live to keys so they expire automatically.
-  - **Data Compaction:** A background worker rewrites cold data files to permanently remove deleted records and reclaim disk space.
-  - **Idle Memory Release:** The server monitors for inactivity and automatically releases unused memory back to the OS.
+  - **Zero-Copy Joins**: A powerful `lookups` pipeline to instantly join documents from different collections using index caching.
+- 🧹 **Automated Background Maintenance:**
+  - **TTL (Time-to-Live):** Assign lifespans to documents for automatic disk-level expiration and cleanup.
+  - **Idle Memory Release:** The server actively monitors traffic and prompts the Go runtime to release unused memory back to the OS during quiet periods.
+- 🔐 **Enterprise-Grade Security:**
+  - **TLS Encryption:** All client-server communication is encrypted with TLS 1.2+ out of the box.
+  - **Strong Authentication:** Passwords are hashed using `bcrypt`.
+  - **Granular RBAC:** Create users and assign specific `read`/`write` permissions down to the collection level.
+  - **Restricted Root Access**: The superuser account is strictly locked to localhost connections.
 
 ---
 
@@ -37,19 +34,20 @@
 
 To get the LunaDB server up and running quickly, follow these steps:
 
-1. **Copy the .env file:**
+1. **Copy the environment file:**
 
-   ```bash
+```bash
    cp .example.env .env
-   ```
+```
 
 2. **Start the services:**
-
-   ```bash
-   docker compose up -d --build
-   ```
-
-   This starts the main database server on port `5876`.
+        
+```bash
+    docker compose up -d --build
+```
+    
+    This spins up the main database server securely on port `5876`.
+    
 
 ---
 
@@ -57,88 +55,89 @@ To get the LunaDB server up and running quickly, follow these steps:
 
 ### Prerequisites
 
-You need **Go version 1.21 or higher** to build and run this project.
+You need **Go version 1.25 or higher** to build and run this project.
 
 ### 1. Generate TLS Certificates 🔒
 
-LunaDB uses TLS for all its communications. You must generate a self-signed certificate pair and place it in the `./certificates/` directory.
+LunaDB requires TLS for all communications. Generate a self-signed certificate pair and place it in the `./certificates/` directory.
 
 1. **Create the directory:**
-
-   ```bash
-   mkdir -p certificates
-   ```
-
-2. **Run the following OpenSSL command to generate a certificate and key:**
-
-   ```bash
-   openssl req -x509 -newkey rsa:4096 -nodes -keyout certificates/server.key -out certificates/server.crt -days 3650 -subj "/CN=localhost" -addext "subjectAltName = DNS:localhost,IP:127.0.0.1"
-   ```
+    
+    ```bash
+    mkdir -p certificates
+    ```
+    
+2. **Generate the certificate and key (OpenSSL):**
+    
+    ```bash
+    openssl req -x509 -newkey rsa:4096 -nodes -keyout certificates/server.key -out certificates/server.crt -days 3650 -subj "/CN=localhost" -addext "subjectAltName = DNS:localhost,IP:127.0.0.1"
+    ```
+    
 
 ### 2. Build and Run
 
-- **Build the Database Server and Client:**
-
-  ```bash
-  go build -o ./bin/lunadb-server .
-  go build -o ./bin/lunadb-client ./cmd/client
-  ```
-
-- **Run the Server Directly:**
-
-  ```bash
-  ./bin/lunadb-server
-  ```
+- **Compile the Server and Client binaries:**
+    
+    ```bash
+    go build -o ./bin/lunadb-server .
+    go build -o ./bin/lunadb-client ./cmd/client
+    ```
+    
+- **Run the Server:**
+    
+    ```bash
+    ./bin/lunadb-server
+    ```
+    
 
 ---
 
 ## 🖥️ CLI Client
 
-You can use the interactive CLI client to connect to and operate the server.
+LunaDB comes with an interactive, autocompleting CLI client to easily manage your data, collections, and users.
 
-- **To connect to the server running in Docker:**
+- **To connect inside Docker:**
+    
+    ```bash
+	docker exec -it <container-id> ./lunadb-client
+	```
+    
+- **For a direct, authenticated connection:**
+    
+    ```bash
+    ./bin/lunadb-client -u admin -p adminpass
+    ```
+    
 
-  ```bash
-  docker exec -it <container-id> ./lunadb-client
-  ```
+> **⚠️ Security Notice:** The default password for `admin` is `adminpass`, and for `root` (localhost only) is `rootpass`. Change these immediately in a production environment using the `update password` command.
 
-- **For a direct and authenticated connection:**
-
-  ```bash
-  ./bin/lunadb-client -u admin -p adminpass
-  ```
-
-> **Important:** The default password for the `admin` user is `adminpass`, and for the `root` user (only accessible from localhost) is `rootpass`. Please change these immediately in a production environment using the `update password` command.
-
-For a full list of commands and detailed examples, see the **[`docs/client.md`](https://github.com/adoboscan21/lunadb/blob/main/docs/client.md)** file.
-
-Once connected, type `help` for available commands.
-
----
-
-## Support the Project
-
-Hello! I'm the developer behind **LunaDB**. This is an open-source project.
-
-I've dedicated a lot of time and effort to this project, and with your support, I can continue to maintain it, add new features, and make it better for everyone.
+Type `help` once connected to explore the full suite of commands. For a detailed query guide, refer to the **[`docs/client.md`](https://github.com/adoboscan21/lunadb/blob/main/docs/client.md)** file.
 
 ---
+
+## ❤️ Support the Project
+
+Hello! I'm the developer behind **LunaDB**. This is a passionate open-source effort to build a modern, high-performance database engine from scratch in Go.
+
+If LunaDB has helped you learn, build, or scale your applications, consider supporting its continued development. Your contributions allow me to maintain the codebase, implement new features, and keep the project thriving.
 
 ### How You Can Help
 
-Every contribution, no matter the size, is a great help and is enormously appreciated. If you would like to support the continued development of this project, you can make a donation via PayPal.
+Every contribution is enormously appreciated. You can make a direct donation via PayPal:
 
-You can donate directly to my PayPal account by clicking the link below:
-
-**[Click here to donate](https://paypal.me/AdonayB?locale.x=es_XC&country.x=VE)**
-
----
+**[Click here to donate via PayPal](https://paypal.me/AdonayB?locale.x=es_XC&country.x=VE)**
 
 ### Other Ways to Contribute
 
-If you can't donate, don't worry! You can still help in other ways:
+Can't donate? You can still make a huge impact:
 
-- **Share the project:** Talk about it on social media or with your friends.
-- **Report bugs:** If you find a problem, open an issue on GitHub.
-- **Contribute code:** If you have coding skills, you can help improve the code.
-  Thank you for your support!
+- ⭐ **Star this repository** to help others find it.
+    
+- 🗣️ **Share the project** on social media or with your engineering team.
+    
+- 🐛 **Report bugs** or request features by opening an issue.
+    
+- 💻 **Contribute code** by submitting a Pull Request.
+    
+
+Thank you for your support!

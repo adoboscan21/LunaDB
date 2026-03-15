@@ -1,6 +1,6 @@
 # 🚀 LunaDB CLI Client Documentation 🚀
 
-The `lunadb-client` is a command-line interface (CLI) for direct, secure interaction with the `lunadb-server` via its custom TLS-encrypted TCP protocol. Designed for speed, security, and scalability.
+The `lunadb-client` is an interactive command-line interface (CLI) for direct, secure interaction with the `lunadb-server` via its custom TLS-encrypted TCP protocol. Designed for speed, security, and developer ergonomics, it seamlessly converts JSON to binary BSON under the hood.
 
 ## ▶️ How to Run
 
@@ -14,9 +14,9 @@ To start the client, you must provide the address of the `lunadb-server`. You ca
 
 **Docker 🐳:**
 
-> `sudo docker exec -it <containerId> lunadb-client -u root -p rootpass localhost:5876`
+> `docker exec -it <containerId> ./lunadb-client -u root -p rootpass localhost:5876`
 
-_Important for Testing: To pass JSON files instead of raw strings, ensure you have a `json/` directory in your working path (e.g., `./json/payload.json`). The CLI will auto-resolve filenames passed as arguments._
+*💡 Pro-Tip for Payloads: Instead of typing raw JSON strings, ensure you have a `json/` directory in your working path (e.g., `./json/payload.json`). The CLI will auto-resolve filenames passed as arguments, read the file, and convert it to BSON automatically.*
 
 ---
 
@@ -38,9 +38,9 @@ Authentication is required to execute most commands. User and permission managem
 
 ## 👑 Main Store Commands (Root Only)
 
-These commands operate on the primary key-value store bypassing collections. Available **only to the `root` user**.
+These commands operate on the primary key-value store bypassing standard document collections. Available **only to the `root` user**.
 
-- 💾 **`set <key> <value_json> [ttl_seconds]`**: Sets a raw key-value pair. Test TTL expiration by appending seconds at the end.
+- 💾 **`set <key> <value_json> [ttl_seconds]`**: Sets a raw key-value pair directly to disk. Test TTL expiration by appending seconds at the end.
 
 - 📥 **`get <key>`**: Retrieves the value associated with a key from the main store.
 
@@ -50,21 +50,21 @@ These commands operate on the primary key-value store bypassing collections. Ava
 
 Low-level administrative operations.
 
-- 📦 **`backup`**: Triggers a full, manual backup of all server data immediately to the `backups/` directory.
+- 📦 **`backup`**: Triggers a **Hot Backup**. Safely takes a snapshot of the entire database to the `backups/` directory without locking concurrent reads or writes.
 
-- 🔙 **`restore <backup_directory_name>`**: **Destructive Action!** Restores the entire server state from a specific backup directory.
+- 🔙 **`restore <backup_filename>`**: **Destructive Action!** Performs a Hot Restore. Wipes the current active buckets, restores the binary data from the specified backup file, and instantly rebuilds all B-Tree indexes in RAM.
 
 ---
 
-## 📦 Transactions
+## 📦 Stateful Transactions
 
-LunaDB supports ACID-like transactions. Group multiple write operations (`set`, `update`, `delete`) and execute them atomically.
+LunaDB supports strict ACID transactions. Group multiple write operations and execute them atomically against the disk.
 
-- **`begin`**: Starts a new transaction block. The prompt will show `[TX]`. Read commands are disabled in this mode.
+- **`begin`**: Starts a new transaction block. The prompt will change to `[TX]`. *(Note: Read commands like `get` or `query` are temporarily disabled in this mode).*
 
-- **`commit`**: Atomically applies all queued commands. Validates existence locks before applying.
+- **`commit`**: Atomically flushes all queued operations to the physical disk in a single write. Validates existence constraints (e.g., preventing updates on non-existent keys) before applying.
 
-- **`rollback`**: Discards all queued commands and releases key locks safely.
+- **`rollback`**: Discards all queued commands in memory and closes the transaction safely.
 
 ---
 
@@ -72,79 +72,81 @@ LunaDB supports ACID-like transactions. Group multiple write operations (`set`, 
 
 ### Collection Management
 
-- ✨ **`collection create <collection_name>`**: Initializes a new collection.
+- ✨ **`collection create <collection_name>`**: Initializes a new physical bucket on disk.
 
-- 🔥 **`collection delete <collection_name>`**: Drops the collection and enqueues async deletion of its disk files.
+- 🔥 **`collection delete <collection_name>`**: Drops the collection, wiping its data from disk and clearing its indexes from RAM.
 
 - 📜 **`collection list`**: Lists all collections you have read access to.
 
 ### 📄 Collection Item Operations
 
-_The `<value_json>` or `<patch_json>` can be a raw string or a file name inside the `json/` directory (e.g., `item.json`)._
+*The `<value_json>` or `<patch_json>` can be a raw string or a file name inside the `json/` directory (e.g., `item.json`).*
 
-- ✅ **`collection item set <collection> [<key>] <value_json|path> [ttl]`**: Saves an item. Omitting the key auto-generates a UUID. Example: `collection item set products laptop-01 {"name": "Pro"} 3600`
+- ✅ **`collection item set <collection> [<key>] <value_json|path> [ttl_seconds]`**: Saves a document. Omitting the key auto-generates a UUID. Example: `collection item set products laptop-01 {"name": "Pro"} 3600`
 
 - 📤 **`collection item get <collection> <key>`**: Gets an item by its key.
 
-- ✍️ **`collection item update <collection> <key> <patch_json|path>`**: Partially updates an item with the fields from the patch.
+- ✍️ **`collection item update <collection> <key> <patch_json|path>`**: Partially updates a document using a Zero-Copy BSON patch technique.
 
-- 🗑️ **`collection item delete <collection> <key>`**: Deletes an item by its key (or tombstone it if it's in cold storage).
+- 🗑️ **`collection item delete <collection> <key>`**: Permanently deletes an item from the disk and removes it from RAM indexes.
 
-- 📋 **`collection item list <collection>`**: **(Root only)** Lists all items in the specified collection.
+- 📋 **`collection item list <collection>`**: **(Root only)** Streams all items in the specified collection.
 
-### ⚡ Batch Operations (Stress Testing)
+### ⚡ Batch Operations (High-Throughput)
+
+Powered by LunaDB's `WriteBatcher` engine, these commands are designed to handle thousands of records in a single physical disk commit.
 
 - **`collection item set many <collection> <json_array|path>`**: Inserts multiple items at once. Skips existing keys. Example: `collection item set many products batch_insert.json`
 
-- **`collection item update many <collection> <patch_json_array|path>`**: Applies patches to multiple items. Payload must be an array of `{"_id": "...", "patch": {...}}`.
+- **`collection item update many <collection> <patch_json_array|path>`**: Applies patches to multiple items instantly. Payload must be a JSON array formatted as `[{"_id": "...", "patch": {...}}]`.
 
-- **`collection item delete many <collection> <keys_json_array|path>`**: Deletes multiple items provided in a JSON array of string keys.
+- **`collection item delete many <collection> <keys_json_array|path>`**: Mass deletes multiple items using a JSON array of string keys.
 
 ---
 
 ## 🔍 Index Commands
 
-Test performance differences by running queries before and after creating indexes.
+Test performance differences by running queries before and after creating B-Tree indexes.
 
-- 📈 **`collection index create <collection> <field_name>`**: Builds a B-Tree index for a specific field.
+- 📈 **`collection index create <collection> <field_name>`**: Builds a B-Tree index in RAM for a specific field, drastically accelerating queries.
 
 - 📜 **`collection index list <collection>`**: Lists all active indexes on the collection.
 
-- 🔥 **`collection index delete <collection> <field_name>`**: Removes an existing index.
+- 🔥 **`collection index delete <collection> <field_name>`**: Removes an existing index from RAM.
 
 ---
 
 ## ❓ Collection Query Command
 
-Execute complex queries with filtering, sorting, joins, and aggregations using zero-copy inspection and mmap for cold data.
+Execute complex queries with filtering, sorting, joins, and on-the-fly aggregations using LunaDB's Zero-Copy BSON streaming engine.
 
 - **`collection query <collection> <query_json|path>`**: Executes a query. Example: `collection query products query1.json`
 
 ### Query JSON Structure
 
-|**Key**|**Type**|**Description**|
-|---|---|---|
-|`filter`|object|Conditions to select items (`WHERE` clause).|
-|`order_by`|array|Sorts the results (`[{"field": "price", "direction": "desc"}]`).|
-|`limit`|number|Restricts the number of results (Optimized via Heap Sort).|
-|`offset`|number|Skips results, used for pagination.|
-|`count`|boolean|Returns a count of matching items.|
-|`distinct`|string|Returns unique values for a field.|
-|`group_by`|array|Groups results for aggregation.|
-|`aggregations`|object|Defines functions like `sum`, `avg`, `min`, `max`, `count`.|
-|`having`|object|Filters results after aggregation.|
-|`projection`|array|Selects which fields to return.|
-|`lookups`|array|Joins data from other collections (In-Memory Hash Join).|
+| **Key**        | **Type** | **Description**                                                                 |
+| :------------- | :------- | :------------------------------------------------------------------------------ |
+| `filter`       | object   | Conditions to select items (`WHERE` clause). Leverages B-Tree index merging.    |
+| `order_by`     | array    | Sorts the results (`[{"field": "price", "direction": "desc"}]`).                |
+| `limit`        | number   | Restricts the number of results (Optimized via Heap Sort or B-Tree fast paths). |
+| `offset`       | number   | Skips results. Highly optimized for Deep Pagination if an index exists.         |
+| `count`        | boolean  | Returns a raw count of matching items.                                          |
+| `distinct`     | string   | Returns unique values for a field (Instantaneous if indexed).                   |
+| `group_by`     | array    | Groups results for aggregation operations.                                      |
+| `aggregations` | object   | Defines mathematical functions: `sum`, `avg`, `min`, `max`, `count`.            |
+| `having`       | object   | Filters results *after* mathematical aggregations are calculated.               |
+| `projection`   | array    | Selects strictly which fields to return.                                        |
+| `lookups`      | array    | Performs in-memory Hash Joins with documents from other collections.            |
 
 ### Supported Filter Operators
 
-|**Operator**|**Syntax**|**Description**|
-|---|---|---|
-|**Comparisons**|`=`, `!=`, `>`, `>=`, `<`, `<=`|Standard numeric and string comparisons.|
-|**Pattern**|`like`|SQL-like pattern matching (`%` for wildcards).|
-|**Inclusion**|`in`, `between`|Check array inclusion or numeric/string ranges.|
-|**Nullity**|`is null`, `is not null`|Checks for the existence or absence of a field.|
-|**Logical**|`and`, `or`, `not`|Combine multiple filter objects.|
+| **Operator**    | **Syntax**                      | **Description**                                                         |
+| :-------------- | :------------------------------ | :---------------------------------------------------------------------- |
+| **Comparisons** | `=`, `!=`, `>`, `>=`, `<`, `<=` | Standard numeric and string comparisons.                                |
+| **Pattern**     | `like`                          | SQL-like pattern matching (`%` for wildcards). Backed by Regex caching. |
+| **Inclusion**   | `in`, `between`                 | Check array inclusion or numeric/string ranges.                         |
+| **Nullity**     | `is null`, `is not null`        | Checks for the existence or absence of a field.                         |
+| **Logical**     | `and`, `or`, `not`              | Combine multiple filter objects.                                        |
 
 ### 🧠 Deep Query Examples
 
@@ -168,8 +170,8 @@ Execute complex queries with filtering, sorting, joins, and aggregations using z
 
 ## 💻 Client-Side Commands
 
-- ℹ️ **`help`**: Displays the list of available commands.
+- ℹ️ **`help`**: Displays the list of all commands dynamically fetched from the server.
 
 - 💨 **`clear`**: Clears the terminal screen.
 
-- 🚪 **`exit`**: Closes the connection and exits the client safely.
+- 🚪 **`exit`**: Closes the TLS connection and exits the client safely (automatically rolling back active transactions).
