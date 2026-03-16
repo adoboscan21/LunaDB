@@ -1,7 +1,3 @@
-/* ==========================================================
-   Ruta y Archivo: ./internal/handler/collection_item_commands.go
-   ========================================================== */
-
 package handler
 
 import (
