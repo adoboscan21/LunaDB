@@ -3,7 +3,6 @@ package store
 import (
 	"log/slog"
 	"sync"
-	"time"
 
 	"go.etcd.io/bbolt"
 	"go.mongodb.org/mongo-driver/bson"
@@ -118,14 +117,12 @@ func (cm *CollectionManager) InitializeFromDisk() error {
 			for k, v := c.First(); k != nil; k, v = c.Next() {
 				var record ItemRecord
 				if err := bson.Unmarshal(v, &record); err == nil {
-					if record.TTL == 0 || time.Since(record.CreatedAt) <= record.TTL {
-						indexedFields := colStore.ListIndexes()
-						dataForIndex := extractIndexedValues(record.Value, indexedFields)
+					indexedFields := colStore.ListIndexes()
+					dataForIndex := extractIndexedValues(record.Value, indexedFields)
 
-						if dataForIndex != nil {
-							if ds, ok := colStore.(*DiskStore); ok {
-								ds.indexes.Update(string(k), nil, dataForIndex)
-							}
+					if dataForIndex != nil {
+						if ds, ok := colStore.(*DiskStore); ok {
+							ds.indexes.Update(string(k), nil, dataForIndex)
 						}
 					}
 				}
@@ -137,63 +134,7 @@ func (cm *CollectionManager) InitializeFromDisk() error {
 	return nil
 }
 
+// Funciones de control de colas (ahora no-ops para la persistencia directa)
 func (cm *CollectionManager) Wait()                                                {}
 func (cm *CollectionManager) EnqueueSaveTask(collectionName string, col DataStore) {}
 func (cm *CollectionManager) EnqueueDeleteTask(collectionName string)              {}
-
-func (cm *CollectionManager) CleanExpiredItemsAndSave() {
-	collectionNames := cm.ListCollections()
-	slog.Info("Starting scheduled TTL sweep across all collections in disk")
-
-	now := time.Now()
-	for _, colName := range collectionNames {
-		var keysToDelete [][]byte
-
-		GlobalDB.View(func(tx *bbolt.Tx) error {
-			b := tx.Bucket([]byte(colName))
-			if b == nil {
-				return nil
-			}
-
-			c := b.Cursor()
-			for k, v := c.First(); k != nil; k, v = c.Next() {
-				var record ItemRecord
-				if err := bson.Unmarshal(v, &record); err == nil {
-					if record.TTL > 0 && now.After(record.CreatedAt.Add(record.TTL)) {
-						keyCopy := make([]byte, len(k))
-						copy(keyCopy, k)
-						keysToDelete = append(keysToDelete, keyCopy)
-					}
-				}
-			}
-			return nil
-		})
-
-		if len(keysToDelete) > 0 {
-			colStore := cm.GetCollection(colName)
-
-			GlobalDB.Update(func(tx *bbolt.Tx) error {
-				b := tx.Bucket([]byte(colName))
-				if b == nil {
-					return nil
-				}
-				for _, k := range keysToDelete {
-					val := b.Get(k)
-					if val != nil {
-						var record ItemRecord
-						if err := bson.Unmarshal(val, &record); err == nil {
-							indexedFields := colStore.ListIndexes()
-							oldDataForIndex := extractIndexedValues(record.Value, indexedFields)
-							if ds, ok := colStore.(*DiskStore); ok && oldDataForIndex != nil {
-								ds.indexes.Remove(string(k), oldDataForIndex)
-							}
-						}
-					}
-					b.Delete(k)
-				}
-				return nil
-			})
-			slog.Info("TTL cleaner removed expired items", "collection", colName, "count", len(keysToDelete))
-		}
-	}
-}

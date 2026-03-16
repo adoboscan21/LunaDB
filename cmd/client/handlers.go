@@ -8,9 +8,7 @@ import (
 	"lunadb/internal/protocol"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
-	"time"
 
 	"github.com/olekukonko/tablewriter"
 )
@@ -38,7 +36,7 @@ func (c *cli) getCommands() map[string]command {
 		// Server Operations (Root only)
 		"backup":  {help: "backup - Triggers a manual server backup (root only)", handler: (*cli).handleBackup, category: "Server Operations"},
 		"restore": {help: "restore <backup_name> - Restores from a backup (root only)", handler: (*cli).handleRestore, category: "Server Operations"},
-		"set":     {help: "set <key> <value_json> [ttl] - Set a key in the main store (root only)", handler: (*cli).handleMainSet, category: "Server Operations"},
+		"set":     {help: "set <key> <value_json> - Set a key in the main store (root only)", handler: (*cli).handleMainSet, category: "Server Operations"},
 		"get":     {help: "get <key> - Get a key from the main store (root only)", handler: (*cli).handleMainGet, category: "Server Operations"},
 
 		// Collection Management
@@ -52,7 +50,7 @@ func (c *cli) getCommands() map[string]command {
 		"collection index list":   {help: "collection index list <coll> - Lists indexes on a collection", handler: (*cli).handleIndexList, category: "Index Management"},
 
 		// Item Operations
-		"collection item set":         {help: "collection item set <coll> [<key>] <value_json|path> [ttl] - Sets an item", handler: (*cli).handleItemSet, category: "Item Operations"},
+		"collection item set":         {help: "collection item set <coll> [<key>] <value_json|path> - Sets an item", handler: (*cli).handleItemSet, category: "Item Operations"},
 		"collection item get":         {help: "collection item get <coll> <key> - Gets an item from a collection", handler: (*cli).handleItemGet, category: "Item Operations"},
 		"collection item delete":      {help: "collection item delete <coll> <key> - Deletes an item from a collection", handler: (*cli).handleItemDelete, category: "Item Operations"},
 		"collection item update":      {help: "collection item update <coll> <key> <patch_json|path> - Updates an item", handler: (*cli).handleItemUpdate, category: "Item Operations"},
@@ -339,26 +337,10 @@ func (c *cli) handleRestore(args string) error {
 func (c *cli) handleMainSet(args string) error {
 	parts := strings.SplitN(args, " ", 2)
 	if len(parts) < 2 {
-		return errors.New("usage: set <key> <value_json> [ttl_seconds]")
+		return errors.New("usage: set <key> <value_json>")
 	}
 	key := parts[0]
-	valueAndTTL := parts[1]
-
-	var jsonArg string
-	var ttl time.Duration
-
-	lastSpaceIndex := strings.LastIndex(valueAndTTL, " ")
-	if lastSpaceIndex != -1 && lastSpaceIndex < len(valueAndTTL)-1 {
-		potentialTTL := valueAndTTL[lastSpaceIndex+1:]
-		if ttlSeconds, err := strconv.Atoi(potentialTTL); err == nil {
-			jsonArg = valueAndTTL[:lastSpaceIndex]
-			ttl = time.Duration(ttlSeconds) * time.Second
-		} else {
-			jsonArg = valueAndTTL
-		}
-	} else {
-		jsonArg = valueAndTTL
-	}
+	jsonArg := parts[1]
 
 	// Conversión del input JSON crudo a BSON antes de enviarlo
 	bsonPayload, err := c.getJSONPayload(jsonArg)
@@ -367,7 +349,7 @@ func (c *cli) handleMainSet(args string) error {
 	}
 
 	var cmdBuf bytes.Buffer
-	protocol.WriteSetCommand(&cmdBuf, key, bsonPayload, ttl)
+	protocol.WriteSetCommand(&cmdBuf, key, bsonPayload)
 	c.conn.Write(cmdBuf.Bytes())
 	return c.readResponse("set")
 }
@@ -476,27 +458,13 @@ func (c *cli) handleItemSet(args string) error {
 		return err
 	}
 
-	parts := strings.Fields(remainingArgs)
-	if len(parts) == 0 {
-		return errors.New("usage: collection item set <coll> [<key>] <value_json|path> [ttl_seconds]")
+	if remainingArgs == "" {
+		return errors.New("usage: collection item set <coll> [<key>] <value_json|path>")
 	}
 
 	var key, jsonArg string
-	var ttl time.Duration = 0
 
-	if len(parts) > 1 {
-		if ttlSeconds, err := strconv.Atoi(parts[len(parts)-1]); err == nil {
-			ttl = time.Duration(ttlSeconds) * time.Second
-			parts = parts[:len(parts)-1]
-		}
-	}
-
-	remainingArgsAfterTTL := strings.Join(parts, " ")
-	if remainingArgsAfterTTL == "" {
-		return errors.New("usage: collection item set <coll> [<key>] <value_json|path> [ttl_seconds]")
-	}
-
-	jsonParts := strings.SplitN(remainingArgsAfterTTL, " ", 2)
+	jsonParts := strings.SplitN(remainingArgs, " ", 2)
 
 	isFirstArgKeyLike := !strings.HasPrefix(jsonParts[0], "{") && !strings.HasPrefix(jsonParts[0], "[")
 
@@ -509,7 +477,7 @@ func (c *cli) handleItemSet(args string) error {
 			jsonArg = jsonParts[1]
 		} else {
 			key = ""
-			jsonArg = remainingArgsAfterTTL
+			jsonArg = remainingArgs
 		}
 	}
 
@@ -523,7 +491,7 @@ func (c *cli) handleItemSet(args string) error {
 	}
 
 	var cmdBuf bytes.Buffer
-	protocol.WriteCollectionItemSetCommand(&cmdBuf, collName, key, jsonPayload, ttl)
+	protocol.WriteCollectionItemSetCommand(&cmdBuf, collName, key, jsonPayload)
 	c.conn.Write(cmdBuf.Bytes())
 	return c.readResponse("collection item set")
 }

@@ -30,11 +30,11 @@ func NewDiskStore(name string) *DiskStore {
 	}
 }
 
-func (s *DiskStore) Set(key string, value []byte, ttl time.Duration) {
+// Set guarda o actualiza un documento en la base de datos persistente.
+func (s *DiskStore) Set(key string, value []byte) {
 	record := ItemRecord{
 		Value:     value,
 		CreatedAt: time.Now(),
-		TTL:       ttl,
 	}
 
 	recordBytes, err := bson.Marshal(record)
@@ -68,7 +68,7 @@ func (s *DiskStore) SetMany(items map[string][]byte) {
 	GlobalDB.Update(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(s.collectionName)
 		for key, value := range items {
-			record := ItemRecord{Value: value, CreatedAt: now, TTL: 0}
+			record := ItemRecord{Value: value, CreatedAt: now}
 			recordBytes, _ := bson.Marshal(record)
 			b.Put([]byte(key), recordBytes)
 
@@ -150,11 +150,9 @@ func (s *DiskStore) Get(key string) ([]byte, bool) {
 		if recordBytes != nil {
 			var record ItemRecord
 			if err := bson.Unmarshal(recordBytes, &record); err == nil {
-				if record.TTL == 0 || time.Since(record.CreatedAt) <= record.TTL {
-					valCopy = make([]byte, len(record.Value))
-					copy(valCopy, record.Value)
-					found = true
-				}
+				valCopy = make([]byte, len(record.Value))
+				copy(valCopy, record.Value)
+				found = true
 			}
 		}
 		return nil
@@ -175,17 +173,6 @@ func (s *DiskStore) StreamAll(callback func(key string, value []byte) bool) {
 			// 🔥 ZERO-COPY FAST PATH: Leemos el BSON binario sin deserializar el struct
 			raw := bson.Raw(v)
 
-			// Verificación de TTL a nivel binario para no perder funcionalidad
-			if ttlVal := raw.Lookup("t"); ttlVal.Type != bsontype.Null {
-				ttl := ttlVal.Int64() // time.Duration se guarda como int64
-				if ttl > 0 {
-					createdAt := raw.Lookup("c").Time()
-					if time.Since(createdAt) > time.Duration(ttl) {
-						continue // Expirado
-					}
-				}
-			}
-
 			// Extraemos los bytes puros del documento interior
 			if val := raw.Lookup("v"); val.Type == bsontype.Binary {
 				_, data := val.Binary()
@@ -199,7 +186,7 @@ func (s *DiskStore) StreamAll(callback func(key string, value []byte) bool) {
 }
 
 func (s *DiskStore) Update(key string, newValue []byte) bool {
-	s.Set(key, newValue, 0)
+	s.Set(key, newValue)
 	return true
 }
 
@@ -222,14 +209,13 @@ func (s *DiskStore) UpdateMany(items map[string][]byte) (int, []string) {
 			}
 
 			// Nota: Aquí se asume que 'newValue' ya es un ItemRecord completo o un BSON crudo.
-			// Para mantener compatibilidad con tu Set, lo envolvemos en ItemRecord.
+			// Lo envolvemos en ItemRecord para mantener compatibilidad persistente.
 			var oldRecord ItemRecord
-			bson.Unmarshal(existing, &oldRecord) // Conservamos el TTL original
+			bson.Unmarshal(existing, &oldRecord)
 
 			record := ItemRecord{
 				Value:     newValue,
 				CreatedAt: oldRecord.CreatedAt,
-				TTL:       oldRecord.TTL,
 			}
 			recordBytes, _ := bson.Marshal(record)
 
@@ -274,7 +260,6 @@ func (s *DiskStore) GetGroupedCount(field string) (map[any]int, bool) {
 }
 
 func (s *DiskStore) Size() int                       { return 0 }
-func (s *DiskStore) CleanExpiredItems() bool         { return false }
 func (s *DiskStore) LoadData(data map[string][]byte) {}
 func (s *DiskStore) GetAll() map[string][]byte       { return nil }
 func (s *DiskStore) GetMany(keys []string) map[string][]byte {

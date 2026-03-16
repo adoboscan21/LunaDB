@@ -40,7 +40,7 @@ Authentication is required to execute most commands. User and permission managem
 
 These commands operate on the primary key-value store bypassing standard document collections. Available **only to the `root` user**.
 
-- 💾 **`set <key> <value_json> [ttl_seconds]`**: Sets a raw key-value pair directly to disk. Test TTL expiration by appending seconds at the end.
+- 💾 **`set <key> <value_json>`**: Sets a raw key-value pair directly to disk.
 
 - 📥 **`get <key>`**: Retrieves the value associated with a key from the main store.
 
@@ -82,7 +82,7 @@ LunaDB supports strict ACID transactions. Group multiple write operations and ex
 
 *The `<value_json>` or `<patch_json>` can be a raw string or a file name inside the `json/` directory (e.g., `item.json`).*
 
-- ✅ **`collection item set <collection> [<key>] <value_json|path> [ttl_seconds]`**: Saves a document. Omitting the key auto-generates a UUID. Example: `collection item set products laptop-01 {"name": "Pro"} 3600`
+- ✅ **`collection item set <collection> [<key>] <value_json|path>`**: Saves a document. Omitting the key auto-generates a UUID. Example: `collection item set products laptop-01 {"name": "Pro"}`
 
 - 📤 **`collection item get <collection> <key>`**: Gets an item by its key.
 

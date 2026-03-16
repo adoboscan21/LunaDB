@@ -195,7 +195,6 @@ func (tm *TransactionManager) Commit(txID string) error {
 				rec := ItemRecord{
 					Value:     enrichedValue,
 					CreatedAt: now,
-					TTL:       0,
 				}
 				recBytes, _ := bson.Marshal(rec)
 

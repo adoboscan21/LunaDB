@@ -11,7 +11,6 @@ import (
 type Config struct {
 	Port                 string
 	ShutdownTimeout      time.Duration
-	TtlCleanInterval     time.Duration
 	BackupInterval       time.Duration
 	BackupRetention      time.Duration
 	WorkerPoolSize       int
@@ -25,7 +24,6 @@ func NewDefaultConfig() Config {
 	return Config{
 		Port:                 ":5876",
 		ShutdownTimeout:      10 * time.Second,
-		TtlCleanInterval:     1 * time.Minute,
 		BackupInterval:       1 * time.Hour,
 		BackupRetention:      7 * 24 * time.Hour,
 		WorkerPoolSize:       100,
@@ -71,7 +69,6 @@ func applyEnvConfig(cfg *Config) {
 	}
 
 	overrideDuration("LUNADB_SHUTDOWN_TIMEOUT", &cfg.ShutdownTimeout)
-	overrideDuration("LUNADB_TTL_CLEAN_INTERVAL", &cfg.TtlCleanInterval)
 	overrideDuration("LUNADB_BACKUP_INTERVAL", &cfg.BackupInterval)
 	overrideDuration("LUNADB_BACKUP_RETENTION", &cfg.BackupRetention)
 }

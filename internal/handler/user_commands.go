@@ -88,7 +88,7 @@ func (h *ConnectionHandler) HandleUserCreate(r io.Reader, conn net.Conn) {
 		return
 	}
 
-	sysCol.Set(userKey, userBytes, 0)
+	sysCol.Set(userKey, userBytes)
 	h.CollectionManager.EnqueueSaveTask(globalconst.SystemCollectionName, sysCol)
 
 	slog.Info("User created successfully", "admin_user", h.AuthenticatedUser, "new_user", username)
@@ -158,7 +158,7 @@ func (h *ConnectionHandler) HandleUserUpdate(r io.Reader, conn net.Conn) {
 	userInfo.Permissions = newPermissions
 	userBytes, _ := bson.Marshal(userInfo)
 
-	sysCol.Set(userKey, userBytes, 0)
+	sysCol.Set(userKey, userBytes)
 	h.CollectionManager.EnqueueSaveTask(globalconst.SystemCollectionName, sysCol)
 
 	slog.Info("User permissions updated successfully", "admin_user", h.AuthenticatedUser, "target_user", username)

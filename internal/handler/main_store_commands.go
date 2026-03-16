@@ -23,7 +23,7 @@ func (h *ConnectionHandler) HandleMainStoreSet(r io.Reader, conn net.Conn) {
 		}
 	}
 
-	key, value, ttl, err := protocol.ReadSetCommand(r)
+	key, value, err := protocol.ReadSetCommand(r)
 	if err != nil {
 		remoteAddr := "recovery"
 		if conn != nil {
@@ -36,7 +36,7 @@ func (h *ConnectionHandler) HandleMainStoreSet(r io.Reader, conn net.Conn) {
 		return
 	}
 
-	h.MainStore.Set(key, value, ttl)
+	h.MainStore.Set(key, value)
 	slog.Debug("Main store SET successful", "key", key, "user", h.AuthenticatedUser)
 
 	if conn != nil {
@@ -75,7 +75,7 @@ func (h *ConnectionHandler) handleMainStoreGet(r io.Reader, conn net.Conn) {
 			slog.Error("Failed to write GET success response", "remote_addr", conn.RemoteAddr().String(), "error", err)
 		}
 	} else {
-		if err := protocol.WriteResponse(conn, protocol.StatusNotFound, fmt.Sprintf("NOT FOUND: Key '%s' not found or expired in main store", key), nil); err != nil {
+		if err := protocol.WriteResponse(conn, protocol.StatusNotFound, fmt.Sprintf("NOT FOUND: Key '%s' not found in main store", key), nil); err != nil {
 			slog.Error("Failed to write GET not found response", "remote_addr", conn.RemoteAddr().String(), "error", err)
 		}
 	}

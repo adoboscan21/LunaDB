@@ -107,7 +107,7 @@ func main() {
 		}
 		adminUserInfoBytes, _ := bson.Marshal(adminUserInfo)
 		// Ya no necesitamos EnqueueSaveTask, el Set va directo al disco físico
-		systemCollection.Set(globalconst.UserPrefix+"admin", adminUserInfoBytes, 0)
+		systemCollection.Set(globalconst.UserPrefix+"admin", adminUserInfoBytes)
 	}
 
 	if _, found := systemCollection.Get(globalconst.UserPrefix + "root"); !found {
@@ -120,7 +120,7 @@ func main() {
 			Permissions:  map[string]string{"*": globalconst.PermissionWrite},
 		}
 		rootUserInfoBytes, _ := bson.Marshal(rootUserInfo)
-		systemCollection.Set(globalconst.UserPrefix+"root", rootUserInfoBytes, 0)
+		systemCollection.Set(globalconst.UserPrefix+"root", rootUserInfoBytes)
 	}
 
 	// --- 4. Inicialización del Servidor TLS ---
@@ -143,7 +143,6 @@ func main() {
 	for w := 1; w <= cfg.WorkerPoolSize; w++ {
 		go func(id int) {
 			for conn := range jobs {
-				// Llamada corregida con exactamente los 5 argumentos requeridos
 				h := handler.GetConnectionHandlerFromPool(
 					mainStore,
 					collectionManager,
@@ -175,23 +174,6 @@ func main() {
 
 	// --- 6. Tareas en Segundo Plano ---
 	shutdownChan := make(chan struct{})
-
-	// Worker de Limpieza de TTL (Lazy Expiration asistida)
-	go func() {
-		ticker := time.NewTicker(cfg.TtlCleanInterval)
-		defer ticker.Stop()
-		slog.Info("Starting TTL cleaner", "interval", cfg.TtlCleanInterval.String())
-		for {
-			select {
-			case <-ticker.C:
-				// El disco barre todo y borra lo que ya expiró físicamente
-				collectionManager.CleanExpiredItemsAndSave()
-			case <-shutdownChan:
-				slog.Info("TTL cleaner stopped.")
-				return
-			}
-		}
-	}()
 
 	// Worker para liberar memoria inactiva del SO (Relevante para el GC de Go)
 	go func() {

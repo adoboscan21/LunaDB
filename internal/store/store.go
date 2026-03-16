@@ -7,22 +7,20 @@ import (
 // ItemRecord es la estructura que serializaremos en el disco (bbolt).
 // Usamos tags cortos de BSON para ahorrar espacio en disco.
 type ItemRecord struct {
-	Value     []byte        `bson:"v"`
-	CreatedAt time.Time     `bson:"c"`
-	TTL       time.Duration `bson:"t"`
+	Value     []byte    `bson:"v"`
+	CreatedAt time.Time `bson:"c"`
 }
 
 type DataStore interface {
-	Set(key string, value []byte, ttl time.Duration)
-	SetMany(items map[string][]byte) // NUEVO
+	Set(key string, value []byte)
+	SetMany(items map[string][]byte)
 	Get(key string) ([]byte, bool)
 	GetMany(keys []string) map[string][]byte
 	Delete(key string)
-	DeleteMany(keys []string) // NUEVO
+	DeleteMany(keys []string)
 	GetAll() map[string][]byte
 	StreamAll(callback func(key string, value []byte) bool)
 	LoadData(data map[string][]byte)
-	CleanExpiredItems() bool
 	Size() int
 	CreateIndex(field string)
 	DeleteIndex(field string)

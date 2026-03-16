@@ -165,7 +165,7 @@ func (h *ConnectionHandler) HandleChangeUserPassword(r io.Reader, conn net.Conn)
 		return
 	}
 
-	sysCol.Set(targetUserKey, updatedUserInfoBytes, 0)
+	sysCol.Set(targetUserKey, updatedUserInfoBytes)
 	h.CollectionManager.EnqueueSaveTask(globalconst.SystemCollectionName, sysCol)
 
 	slog.Info("User password changed successfully", "admin_user", h.AuthenticatedUser, "target_user", targetUsername)

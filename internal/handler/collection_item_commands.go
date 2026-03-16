@@ -17,7 +17,7 @@ import (
 
 // HandleCollectionItemSet processes the CmdCollectionItemSet command.
 func (h *ConnectionHandler) HandleCollectionItemSet(r io.Reader, conn net.Conn) {
-	collectionName, key, value, ttl, err := protocol.ReadCollectionItemSetCommand(r)
+	collectionName, key, value, err := protocol.ReadCollectionItemSetCommand(r)
 	if err != nil {
 		slog.Error("Failed to read COLLECTION_ITEM_SET command payload", "error", err)
 		protocol.WriteResponse(conn, protocol.StatusBadCommand, "Invalid COLLECTION_ITEM_SET command format", nil)
@@ -88,7 +88,7 @@ func (h *ConnectionHandler) HandleCollectionItemSet(r io.Reader, conn net.Conn) 
 	data[globalconst.CREATED_AT] = now
 
 	finalValue, _ := bson.Marshal(data)
-	colStore.Set(key, finalValue, ttl)
+	colStore.Set(key, finalValue)
 
 	slog.Info("Item set in collection", "user", h.AuthenticatedUser, "collection", collectionName, "key", key)
 	protocol.WriteResponse(conn, protocol.StatusOk, fmt.Sprintf("OK: Key '%s' set in collection '%s'", key, collectionName), finalValue)

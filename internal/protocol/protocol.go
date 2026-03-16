@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"time"
 )
 
 // CommandType defines the type of operation requested by the client.
@@ -13,7 +12,7 @@ type CommandType byte
 
 const (
 	// Main Store Commands
-	CmdSet CommandType = iota + 1 // SET key, value, ttl
+	CmdSet CommandType = iota + 1 // SET key, value
 	CmdGet                        // GET key
 
 	// Collection Management Commands
@@ -25,7 +24,7 @@ const (
 	CmdCollectionIndexList   // LIST_COLLECTION_INDEXES collectionName
 
 	// Collection Item Commands
-	CmdCollectionItemSet        // SET_COLLECTION_ITEM collectionName, key, value, ttl
+	CmdCollectionItemSet        // SET_COLLECTION_ITEM collectionName, key, value
 	CmdCollectionItemSetMany    // SET_COLLECTION_ITEMS_MANY collectionName, json_array
 	CmdCollectionItemGet        // GET_COLLECTION_ITEM collectionName, key
 	CmdCollectionItemDelete     // DELETE_COLLECTION_ITEM collectionName, key
@@ -289,8 +288,8 @@ func WriteBytes(w io.Writer, b []byte) error {
 }
 
 // WriteSetCommand writes a SET command to the connection.
-// Format: [CmdSet (1 byte)] [KeyLength (4 bytes)] [Key] [ValueLength (4 bytes)] [Value] [TTLSeconds (8 bytes)]
-func WriteSetCommand(w io.Writer, key string, value []byte, ttl time.Duration) error {
+// Format: [CmdSet (1 byte)] [KeyLength (4 bytes)] [Key] [ValueLength (4 bytes)] [Value]
+func WriteSetCommand(w io.Writer, key string, value []byte) error {
 	if _, err := w.Write([]byte{byte(CmdSet)}); err != nil {
 		return fmt.Errorf("failed to write command type: %w", err)
 	}
@@ -300,28 +299,20 @@ func WriteSetCommand(w io.Writer, key string, value []byte, ttl time.Duration) e
 	if err := WriteBytes(w, value); err != nil {
 		return fmt.Errorf("failed to write value: %w", err)
 	}
-	if err := binary.Write(w, ByteOrder, int64(ttl.Seconds())); err != nil {
-		return fmt.Errorf("failed to write TTL seconds: %w", err)
-	}
 	return nil
 }
 
 // ReadSetCommand reads a SET command from the connection.
-func ReadSetCommand(r io.Reader) (key string, value []byte, ttl time.Duration, err error) {
+func ReadSetCommand(r io.Reader) (key string, value []byte, err error) {
 	key, err = ReadString(r)
 	if err != nil {
-		return "", nil, 0, fmt.Errorf("failed to read key: %w", err)
+		return "", nil, fmt.Errorf("failed to read key: %w", err)
 	}
 	value, err = ReadBytes(r)
 	if err != nil {
-		return "", nil, 0, fmt.Errorf("failed to read value: %w", err)
+		return "", nil, fmt.Errorf("failed to read value: %w", err)
 	}
-	var ttlSeconds int64
-	if err := binary.Read(r, ByteOrder, &ttlSeconds); err != nil {
-		return "", nil, 0, fmt.Errorf("failed to read TTL seconds: %w", err)
-	}
-	ttl = time.Duration(ttlSeconds) * time.Second
-	return key, value, ttl, nil
+	return key, value, nil
 }
 
 // WriteGetCommand writes a GET command to the connection.
@@ -397,8 +388,8 @@ func WriteCollectionListCommand(w io.Writer) error {
 }
 
 // WriteCollectionItemSetCommand writes a SET_COLLECTION_ITEM command to the connection.
-// Format: [CmdCollectionItemSet (1 byte)] [ColNameLength] [ColName] [KeyLength] [Key] [ValueLength] [Value] [TTLSeconds]
-func WriteCollectionItemSetCommand(w io.Writer, collectionName, key string, value []byte, ttl time.Duration) error {
+// Format: [CmdCollectionItemSet (1 byte)] [ColNameLength] [ColName] [KeyLength] [Key] [ValueLength] [Value]
+func WriteCollectionItemSetCommand(w io.Writer, collectionName, key string, value []byte) error {
 	if _, err := w.Write([]byte{byte(CmdCollectionItemSet)}); err != nil {
 		return fmt.Errorf("failed to write command type: %w", err)
 	}
@@ -411,32 +402,24 @@ func WriteCollectionItemSetCommand(w io.Writer, collectionName, key string, valu
 	if err := WriteBytes(w, value); err != nil {
 		return fmt.Errorf("failed to write value: %w", err)
 	}
-	if err := binary.Write(w, ByteOrder, int64(ttl.Seconds())); err != nil {
-		return fmt.Errorf("failed to write TTL seconds: %w", err)
-	}
 	return nil
 }
 
 // ReadCollectionItemSetCommand reads a SET_COLLECTION_ITEM command from the connection.
-func ReadCollectionItemSetCommand(r io.Reader) (collectionName, key string, value []byte, ttl time.Duration, err error) {
+func ReadCollectionItemSetCommand(r io.Reader) (collectionName, key string, value []byte, err error) {
 	collectionName, err = ReadString(r)
 	if err != nil {
-		return "", "", nil, 0, fmt.Errorf("failed to read collection name: %w", err)
+		return "", "", nil, fmt.Errorf("failed to read collection name: %w", err)
 	}
 	key, err = ReadString(r)
 	if err != nil {
-		return "", "", nil, 0, fmt.Errorf("failed to read key: %w", err)
+		return "", "", nil, fmt.Errorf("failed to read key: %w", err)
 	}
 	value, err = ReadBytes(r)
 	if err != nil {
-		return "", "", nil, 0, fmt.Errorf("failed to read value: %w", err)
+		return "", "", nil, fmt.Errorf("failed to read value: %w", err)
 	}
-	var ttlSeconds int64
-	if err := binary.Read(r, ByteOrder, &ttlSeconds); err != nil {
-		return "", "", nil, 0, fmt.Errorf("failed to read TTL seconds: %w", err)
-	}
-	ttl = time.Duration(ttlSeconds) * time.Second
-	return collectionName, key, value, ttl, nil
+	return collectionName, key, value, nil
 }
 
 // WriteCollectionItemUpdateCommand writes a UPDATE_COLLECTION_ITEM command to the connection.
@@ -817,35 +800,35 @@ func ReadCommandPayload(r io.Reader, cmdType CommandType) ([]byte, error) {
 	var buf bytes.Buffer
 	structure := map[CommandType]struct {
 		numStr, numBytes int
-		hasTTL, hasKeys  bool
+		hasKeys          bool
 	}{
-		CmdSet:                      {1, 1, true, false},
-		CmdGet:                      {1, 0, false, false},
-		CmdCollectionCreate:         {1, 0, false, false},
-		CmdCollectionDelete:         {1, 0, false, false},
-		CmdCollectionList:           {0, 0, false, false},
-		CmdCollectionIndexCreate:    {2, 0, false, false},
-		CmdCollectionIndexDelete:    {2, 0, false, false},
-		CmdCollectionIndexList:      {1, 0, false, false},
-		CmdCollectionItemSet:        {2, 1, true, false},
-		CmdCollectionItemSetMany:    {1, 1, false, false},
-		CmdCollectionItemGet:        {2, 0, false, false},
-		CmdCollectionItemDelete:     {2, 0, false, false},
-		CmdCollectionItemList:       {1, 0, false, false},
-		CmdCollectionQuery:          {1, 1, false, false},
-		CmdCollectionItemDeleteMany: {1, 0, false, true},
-		CmdCollectionItemUpdate:     {2, 1, false, false},
-		CmdCollectionItemUpdateMany: {1, 1, false, false},
-		CmdAuthenticate:             {2, 0, false, false},
-		CmdChangeUserPassword:       {2, 0, false, false},
-		CmdUserCreate:               {2, 1, false, false},
-		CmdUserUpdate:               {1, 1, false, false},
-		CmdUserDelete:               {1, 0, false, false},
-		CmdBackup:                   {0, 0, false, false},
-		CmdRestore:                  {1, 0, false, false},
-		CmdBegin:                    {0, 0, false, false},
-		CmdCommit:                   {0, 0, false, false},
-		CmdRollback:                 {0, 0, false, false},
+		CmdSet:                      {1, 1, false},
+		CmdGet:                      {1, 0, false},
+		CmdCollectionCreate:         {1, 0, false},
+		CmdCollectionDelete:         {1, 0, false},
+		CmdCollectionList:           {0, 0, false},
+		CmdCollectionIndexCreate:    {2, 0, false},
+		CmdCollectionIndexDelete:    {2, 0, false},
+		CmdCollectionIndexList:      {1, 0, false},
+		CmdCollectionItemSet:        {2, 1, false},
+		CmdCollectionItemSetMany:    {1, 1, false},
+		CmdCollectionItemGet:        {2, 0, false},
+		CmdCollectionItemDelete:     {2, 0, false},
+		CmdCollectionItemList:       {1, 0, false},
+		CmdCollectionQuery:          {1, 1, false},
+		CmdCollectionItemDeleteMany: {1, 0, true},
+		CmdCollectionItemUpdate:     {2, 1, false},
+		CmdCollectionItemUpdateMany: {1, 1, false},
+		CmdAuthenticate:             {2, 0, false},
+		CmdChangeUserPassword:       {2, 0, false},
+		CmdUserCreate:               {2, 1, false},
+		CmdUserUpdate:               {1, 1, false},
+		CmdUserDelete:               {1, 0, false},
+		CmdBackup:                   {0, 0, false},
+		CmdRestore:                  {1, 0, false},
+		CmdBegin:                    {0, 0, false},
+		CmdCommit:                   {0, 0, false},
+		CmdRollback:                 {0, 0, false},
 	}
 
 	spec, ok := structure[cmdType]
@@ -867,14 +850,6 @@ func ReadCommandPayload(r io.Reader, cmdType CommandType) ([]byte, error) {
 			return nil, err
 		}
 		WriteBytes(&buf, b)
-	}
-
-	if spec.hasTTL {
-		var ttlSeconds int64
-		if err := binary.Read(r, ByteOrder, &ttlSeconds); err != nil {
-			return nil, err
-		}
-		binary.Write(&buf, ByteOrder, ttlSeconds)
 	}
 
 	if spec.hasKeys {
