@@ -1,4 +1,4 @@
-# 🚀 LunaDB 🐺
+# 🚀 LunaDB 🐈
 
 **LunaDB** is a high-performance, disk-first document and key-value database designed for extreme concurrency, unbreakable durability, and sub-millisecond query speeds. Built from scratch in Go, it seamlessly blends the flexibility of a NoSQL document store with the ACID guarantees and structured querying capabilities of a traditional relational database, all secured over a TLS-encrypted custom TCP protocol.
 
@@ -10,7 +10,7 @@ LunaDB was built to solve specific bottlenecks in traditional relational databas
 
 In a simulated Enterprise ERP peak load benchmark (**1,000,000** historical records, **10,000** concurrent connections), LunaDB's architecture shines:
 
-| Operation / Metric | LunaDB 🐺 | PostgreSQL 🐘 | Winner |
+| Operation / Metric | LunaDB 🐈 | PostgreSQL 🐘 | Winner |
 | :--- | :--- | :--- | :--- |
 | **Deep Pagination** (`OFFSET 500k`) | **~4.4 ms** | ~490.6 ms | **LunaDB** (110x faster) |
 | **Distinct Grouping** (Array sizing) | **~0.5 ms** | ~105.2 ms | **LunaDB** (200x faster) |
