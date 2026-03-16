@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"log/slog"
@@ -468,4 +469,115 @@ func applyBSONPatchFast(existingValue []byte, patchData bson.M, now time.Time) (
 	}
 
 	return bson.Marshal(newDoc)
+}
+
+// HandleCollectionUpdateWhere processes the CmdCollectionUpdateWhere command.
+func (h *ConnectionHandler) HandleCollectionUpdateWhere(r io.Reader, conn net.Conn) {
+	collectionName, queryBSON, patchBSON, err := protocol.ReadCollectionUpdateWhereCommand(r)
+	if err != nil || collectionName == "" {
+		protocol.WriteResponse(conn, protocol.StatusBadRequest, "Invalid request", nil)
+		return
+	}
+	if !h.hasPermission(collectionName, globalconst.PermissionWrite) {
+		protocol.WriteResponse(conn, protocol.StatusUnauthorized, "UNAUTHORIZED", nil)
+		return
+	}
+
+	query := queryPool.Get().(*Query)
+	defer func() { query.Reset(); queryPool.Put(query) }()
+	if err := bson.Unmarshal(queryBSON, query); err != nil {
+		protocol.WriteResponse(conn, protocol.StatusBadRequest, "Invalid query BSON format", nil)
+		return
+	}
+
+	// Forzamos la proyección para solo traer el _id y ahorrar RAM
+	query.Projection = []string{globalconst.ID}
+
+	results, err := h.processCollectionQuery(collectionName, query)
+	if err != nil {
+		protocol.WriteResponse(conn, protocol.StatusError, "Failed to execute query", nil)
+		return
+	}
+
+	docs, ok := results.([]bson.M)
+	if !ok || len(docs) == 0 {
+		protocol.WriteResponse(conn, protocol.StatusOk, "OK: 0 items matched the condition.", nil)
+		return
+	}
+
+	// Transformamos los resultados al formato que espera HandleCollectionItemUpdateMany
+	var payload struct {
+		Array []updateManyPayload `bson:"array"`
+	}
+
+	var patchData bson.M
+	bson.Unmarshal(patchBSON, &patchData)
+
+	for _, doc := range docs {
+		if idVal, exists := doc[globalconst.ID]; exists {
+			payload.Array = append(payload.Array, updateManyPayload{
+				ID:    idVal.(string),
+				Patch: patchData,
+			})
+		}
+	}
+
+	payloadBSON, _ := bson.Marshal(payload)
+
+	// Reutilizamos tu comando de Bulk Update pasando el BSON simulado
+	var buf bytes.Buffer
+	protocol.WriteCollectionItemUpdateManyCommand(&buf, collectionName, payloadBSON)
+
+	// CORRECCIÓN: Solo descartamos 1 byte (el ID del comando).
+	// La función llamada abajo SÍ necesita leer el nombre de la colección del buffer.
+	buf.Next(1)
+	h.HandleCollectionItemUpdateMany(&buf, conn)
+}
+
+// HandleCollectionDeleteWhere processes the CmdCollectionDeleteWhere command.
+func (h *ConnectionHandler) HandleCollectionDeleteWhere(r io.Reader, conn net.Conn) {
+	collectionName, queryBSON, err := protocol.ReadCollectionDeleteWhereCommand(r)
+	if err != nil || collectionName == "" {
+		protocol.WriteResponse(conn, protocol.StatusBadRequest, "Invalid request", nil)
+		return
+	}
+	if !h.hasPermission(collectionName, globalconst.PermissionWrite) {
+		protocol.WriteResponse(conn, protocol.StatusUnauthorized, "UNAUTHORIZED", nil)
+		return
+	}
+
+	query := queryPool.Get().(*Query)
+	defer func() { query.Reset(); queryPool.Put(query) }()
+	if err := bson.Unmarshal(queryBSON, query); err != nil {
+		protocol.WriteResponse(conn, protocol.StatusBadRequest, "Invalid query BSON format", nil)
+		return
+	}
+
+	query.Projection = []string{globalconst.ID}
+
+	results, err := h.processCollectionQuery(collectionName, query)
+	if err != nil {
+		protocol.WriteResponse(conn, protocol.StatusError, "Failed to execute query", nil)
+		return
+	}
+
+	docs, ok := results.([]bson.M)
+	if !ok || len(docs) == 0 {
+		protocol.WriteResponse(conn, protocol.StatusOk, "OK: 0 items matched the condition.", nil)
+		return
+	}
+
+	var keys []string
+	for _, doc := range docs {
+		if idVal, exists := doc[globalconst.ID]; exists {
+			keys = append(keys, idVal.(string))
+		}
+	}
+
+	var buf bytes.Buffer
+	protocol.WriteCollectionItemDeleteManyCommand(&buf, collectionName, keys)
+
+	// CORRECCIÓN: Solo descartamos 1 byte.
+	buf.Next(1)
+	h.HandleCollectionItemDeleteMany(&buf, conn)
 }

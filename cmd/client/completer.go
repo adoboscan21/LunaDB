@@ -55,6 +55,8 @@ func (c *cli) getCompleter() readline.AutoCompleter {
 				readline.PcItem("update many", readline.PcItemDynamic(c.fetchCollectionNames, readline.PcItemDynamic(c.fetchJSONFileNames))),
 			),
 			readline.PcItem("query", readline.PcItemDynamic(c.fetchCollectionNames, readline.PcItemDynamic(c.fetchJSONFileNames))),
+			readline.PcItem("update where", readline.PcItemDynamic(c.fetchCollectionNames, readline.PcItemDynamic(c.fetchJSONFileNames))),
+			readline.PcItem("delete where", readline.PcItemDynamic(c.fetchCollectionNames, readline.PcItemDynamic(c.fetchJSONFileNames))),
 		),
 		readline.PcItem("clear"),
 		readline.PcItem("help"),

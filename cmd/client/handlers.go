@@ -61,6 +61,10 @@ func (c *cli) getCommands() map[string]command {
 
 		// Query
 		"collection query": {help: "collection query <coll> <query_json|path> - Performs a complex query", handler: (*cli).handleQuery, category: "Query"},
+
+		// Update Where - Delete Where
+		"collection update where": {help: "collection update where <coll> <query_json|path> <patch_json|path> - Updates items matching a query", handler: (*cli).handleUpdateWhere, category: "Item Operations"},
+		"collection delete where": {help: "collection delete where <coll> <query_json|path> - Deletes items matching a query", handler: (*cli).handleDeleteWhere, category: "Item Operations"},
 	}
 }
 
@@ -650,4 +654,53 @@ func (c *cli) handleItemDeleteMany(args string) error {
 	protocol.WriteCollectionItemDeleteManyCommand(&cmdBuf, collName, keysToDelete)
 	c.conn.Write(cmdBuf.Bytes())
 	return c.readResponse("collection item delete many")
+}
+
+// handleUpdateWhere handles the "collection update where" command.
+func (c *cli) handleUpdateWhere(args string) error {
+	collName, remainingArgs, err := c.resolveCollectionName(args, "collection update where")
+	if err != nil {
+		return err
+	}
+
+	parts := strings.SplitN(remainingArgs, " ", 2)
+	if len(parts) != 2 {
+		return errors.New("usage: collection update where <coll> <query_json|path> <patch_json|path>")
+	}
+
+	queryPayload, err := c.getJSONPayload(parts[0])
+	if err != nil {
+		return err
+	}
+
+	patchPayload, err := c.getJSONPayload(parts[1])
+	if err != nil {
+		return err
+	}
+
+	var cmdBuf bytes.Buffer
+	protocol.WriteCollectionUpdateWhereCommand(&cmdBuf, collName, queryPayload, patchPayload)
+	c.conn.Write(cmdBuf.Bytes())
+	return c.readResponse("collection update where")
+}
+
+// handleDeleteWhere handles the "collection delete where" command.
+func (c *cli) handleDeleteWhere(args string) error {
+	collName, remainingArgs, err := c.resolveCollectionName(args, "collection delete where")
+	if err != nil {
+		return err
+	}
+	if remainingArgs == "" {
+		return errors.New("usage: collection delete where <coll> <query_json|path>")
+	}
+
+	queryPayload, err := c.getJSONPayload(remainingArgs)
+	if err != nil {
+		return err
+	}
+
+	var cmdBuf bytes.Buffer
+	protocol.WriteCollectionDeleteWhereCommand(&cmdBuf, collName, queryPayload)
+	c.conn.Write(cmdBuf.Bytes())
+	return c.readResponse("collection delete where")
 }

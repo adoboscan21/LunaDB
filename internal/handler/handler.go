@@ -185,6 +185,10 @@ func (h *ConnectionHandler) HandleConnection(conn net.Conn) {
 			h.handleBackup(reader, conn)
 		case protocol.CmdRestore:
 			h.HandleRestore(reader, conn)
+		case protocol.CmdCollectionUpdateWhere:
+			h.HandleCollectionUpdateWhere(reader, conn)
+		case protocol.CmdCollectionDeleteWhere:
+			h.HandleCollectionDeleteWhere(reader, conn)
 		default:
 			slog.Warn("Received unhandled command type", "command_type", cmdType, "remote_addr", conn.RemoteAddr().String())
 			protocol.WriteResponse(conn, protocol.StatusBadCommand, fmt.Sprintf("BAD COMMAND: Unhandled or unknown command type %d", cmdType), nil)

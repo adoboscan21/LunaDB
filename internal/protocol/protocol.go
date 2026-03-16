@@ -33,6 +33,8 @@ const (
 	CmdCollectionItemDeleteMany // DELETE_COLLECTION_ITEMS_MANY collectionName, keys_array
 	CmdCollectionItemUpdate     // UPDATE_COLLECTION_ITEM collectionName, key, patch_value
 	CmdCollectionItemUpdateMany // UPDATE_COLLECTION_ITEMS_MANY collectionName, json_array
+	CmdCollectionUpdateWhere    // UPDATE_WHERE collectionName, query_json, patch_json
+	CmdCollectionDeleteWhere    // DELETE_WHERE collectionName, query_json
 
 	// Authentication Commands
 	CmdAuthenticate       // AUTH username, password
@@ -829,6 +831,8 @@ func ReadCommandPayload(r io.Reader, cmdType CommandType) ([]byte, error) {
 		CmdBegin:                    {0, 0, false},
 		CmdCommit:                   {0, 0, false},
 		CmdRollback:                 {0, 0, false},
+		CmdCollectionUpdateWhere:    {1, 2, false},
+		CmdCollectionDeleteWhere:    {1, 1, false},
 	}
 
 	spec, ok := structure[cmdType]
@@ -868,4 +872,60 @@ func ReadCommandPayload(r io.Reader, cmdType CommandType) ([]byte, error) {
 	}
 
 	return buf.Bytes(), nil
+}
+
+// WriteCollectionUpdateWhereCommand writes a UPDATE_WHERE command.
+func WriteCollectionUpdateWhereCommand(w io.Writer, collectionName string, queryBSON, patchBSON []byte) error {
+	if _, err := w.Write([]byte{byte(CmdCollectionUpdateWhere)}); err != nil {
+		return err
+	}
+	if err := WriteString(w, collectionName); err != nil {
+		return err
+	}
+	if err := WriteBytes(w, queryBSON); err != nil {
+		return err
+	}
+	if err := WriteBytes(w, patchBSON); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ReadCollectionUpdateWhereCommand reads a UPDATE_WHERE command.
+func ReadCollectionUpdateWhereCommand(r io.Reader) (collectionName string, queryBSON, patchBSON []byte, err error) {
+	if collectionName, err = ReadString(r); err != nil {
+		return
+	}
+	if queryBSON, err = ReadBytes(r); err != nil {
+		return
+	}
+	if patchBSON, err = ReadBytes(r); err != nil {
+		return
+	}
+	return
+}
+
+// WriteCollectionDeleteWhereCommand writes a DELETE_WHERE command.
+func WriteCollectionDeleteWhereCommand(w io.Writer, collectionName string, queryBSON []byte) error {
+	if _, err := w.Write([]byte{byte(CmdCollectionDeleteWhere)}); err != nil {
+		return err
+	}
+	if err := WriteString(w, collectionName); err != nil {
+		return err
+	}
+	if err := WriteBytes(w, queryBSON); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ReadCollectionDeleteWhereCommand reads a DELETE_WHERE command.
+func ReadCollectionDeleteWhereCommand(r io.Reader) (collectionName string, queryBSON []byte, err error) {
+	if collectionName, err = ReadString(r); err != nil {
+		return
+	}
+	if queryBSON, err = ReadBytes(r); err != nil {
+		return
+	}
+	return
 }
