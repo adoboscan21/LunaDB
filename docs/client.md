@@ -94,13 +94,17 @@ LunaDB supports strict ACID transactions. Group multiple write operations and ex
 
 ### ⚡ Batch Operations (High-Throughput)
 
-Powered by LunaDB's `WriteBatcher` engine, these commands are designed to handle thousands of records in a single physical disk commit.
+Powered by LunaDB's `WriteBatcher` engine and Server-Side Query execution, these commands are designed to handle thousands of records in a single physical disk commit without moving data over the network.
 
 - **`collection item set many <collection> <json_array|path>`**: Inserts multiple items at once. Skips existing keys. Example: `collection item set many products batch_insert.json`
 
 - **`collection item update many <collection> <patch_json_array|path>`**: Applies patches to multiple items instantly. Payload must be a JSON array formatted as `[{"_id": "...", "patch": {...}}]`.
 
 - **`collection item delete many <collection> <keys_json_array|path>`**: Mass deletes multiple items using a JSON array of string keys.
+
+- 🎯 **`collection update where <collection> <query_json|path> <patch_json|path>`**: Mass updates all documents that match a specific query condition using a BSON patch. Highly optimized server-side operation. Example: `collection update where orders {"filter":{"field":"status","op":"=","value":"Pending"}} {"status":"Shipped"}`
+
+- 🧨 **`collection delete where <collection> <query_json|path>`**: Mass deletes all documents that match a specific query condition. Fast and efficient index-level deletion. Example: `collection delete where orders {"filter":{"field":"status","op":"=","value":"Cancelled"}}`
 
 ---
 
@@ -124,29 +128,29 @@ Execute complex queries with filtering, sorting, joins, and on-the-fly aggregati
 
 ### Query JSON Structure
 
-| **Key**        | **Type** | **Description**                                                                 |
-| :------------- | :------- | :------------------------------------------------------------------------------ |
-| `filter`       | object   | Conditions to select items (`WHERE` clause). Leverages B-Tree index merging.    |
-| `order_by`     | array    | Sorts the results (`[{"field": "price", "direction": "desc"}]`).                |
-| `limit`        | number   | Restricts the number of results (Optimized via Heap Sort or B-Tree fast paths). |
-| `offset`       | number   | Skips results. Highly optimized for Deep Pagination if an index exists.         |
-| `count`        | boolean  | Returns a raw count of matching items.                                          |
-| `distinct`     | string   | Returns unique values for a field (Instantaneous if indexed).                   |
-| `group_by`     | array    | Groups results for aggregation operations.                                      |
-| `aggregations` | object   | Defines mathematical functions: `sum`, `avg`, `min`, `max`, `count`.            |
-| `having`       | object   | Filters results *after* mathematical aggregations are calculated.               |
-| `projection`   | array    | Selects strictly which fields to return.                                        |
-| `lookups`      | array    | Performs in-memory Hash Joins with documents from other collections.            |
+| **Key** | **Type** | **Description** |
+| :--- | :--- | :--- |
+| `filter` | object | Conditions to select items (`WHERE` clause). Leverages B-Tree index merging. |
+| `order_by` | array | Sorts the results (`[{"field": "price", "direction": "desc"}]`). |
+| `limit` | number | Restricts the number of results (Optimized via Heap Sort or B-Tree fast paths). |
+| `offset` | number | Skips results. Highly optimized for Deep Pagination if an index exists. |
+| `count` | boolean | Returns a raw count of matching items. |
+| `distinct` | string | Returns unique values for a field (Instantaneous if indexed). |
+| `group_by` | array | Groups results for aggregation operations. |
+| `aggregations` | object | Defines mathematical functions: `sum`, `avg`, `min`, `max`, `count`. |
+| `having` | object | Filters results *after* mathematical aggregations are calculated. |
+| `projection` | array | Selects strictly which fields to return. |
+| `lookups` | array | Performs in-memory Hash Joins with documents from other collections. |
 
 ### Supported Filter Operators
 
-| **Operator**    | **Syntax**                      | **Description**                                                         |
-| :-------------- | :------------------------------ | :---------------------------------------------------------------------- |
-| **Comparisons** | `=`, `!=`, `>`, `>=`, `<`, `<=` | Standard numeric and string comparisons.                                |
-| **Pattern**     | `like`                          | SQL-like pattern matching (`%` for wildcards). Backed by Regex caching. |
-| **Inclusion**   | `in`, `between`                 | Check array inclusion or numeric/string ranges.                         |
-| **Nullity**     | `is null`, `is not null`        | Checks for the existence or absence of a field.                         |
-| **Logical**     | `and`, `or`, `not`              | Combine multiple filter objects.                                        |
+| **Operator** | **Syntax** | **Description** |
+| :--- | :--- | :--- |
+| **Comparisons** | `=`, `!=`, `>`, `>=`, `<`, `<=` | Standard numeric and string comparisons. |
+| **Pattern** | `like` | SQL-like pattern matching (`%` for wildcards). Backed by Regex caching. |
+| **Inclusion** | `in`, `between` | Check array inclusion or numeric/string ranges. |
+| **Nullity** | `is null`, `is not null` | Checks for the existence or absence of a field. |
+| **Logical** | `and`, `or`, `not` | Combine multiple filter objects. |
 
 ### 🧠 Deep Query Examples
 
@@ -174,4 +178,4 @@ Execute complex queries with filtering, sorting, joins, and on-the-fly aggregati
 
 - 💨 **`clear`**: Clears the terminal screen.
 
-- 🚪 **`exit`**: Closes the TLS connection and exits the client safely (automatically rolling back active transactions).
+- 🚪 **`exit`**: Closes the TLS connection and exits the client safely (automatically rolling back active transactions)
