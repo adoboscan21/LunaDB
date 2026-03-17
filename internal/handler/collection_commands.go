@@ -43,7 +43,7 @@ func (h *ConnectionHandler) HandleCollectionCreate(r io.Reader, conn net.Conn) {
 
 	if h.CollectionManager.CollectionExists(collectionName) {
 		if conn != nil {
-			protocol.WriteResponse(conn, protocol.StatusOk, fmt.Sprintf("OK: Collection '%s' already exists.", collectionName), nil)
+			protocol.WriteResponse(conn, protocol.StatusBadRequest, fmt.Sprintf("OK: Collection '%s' already exists.", collectionName), nil)
 		}
 		return
 	}
