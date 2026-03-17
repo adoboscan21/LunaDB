@@ -263,11 +263,27 @@ func (s *DiskStore) Size() int                       { return 0 }
 func (s *DiskStore) LoadData(data map[string][]byte) {}
 func (s *DiskStore) GetAll() map[string][]byte       { return nil }
 func (s *DiskStore) GetMany(keys []string) map[string][]byte {
-	res := make(map[string][]byte)
-	for _, k := range keys {
-		if val, ok := s.Get(k); ok {
-			res[k] = val
+	res := make(map[string][]byte, len(keys))
+
+	GlobalDB.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket(s.collectionName)
+		if b == nil {
+			return nil
 		}
-	}
+		for _, k := range keys {
+			if recordBytes := b.Get([]byte(k)); recordBytes != nil {
+				// ZERO-COPY FAST PATH: Extraemos el campo 'v' (Value) directo del BSON binario
+				raw := bson.Raw(recordBytes)
+				if val := raw.Lookup("v"); val.Type == bsontype.Binary {
+					_, data := val.Binary()
+					valCopy := make([]byte, len(data))
+					copy(valCopy, data)
+					res[k] = valCopy
+				}
+			}
+		}
+		return nil
+	})
+
 	return res
 }

@@ -148,28 +148,31 @@ func (tm *TransactionManager) Commit(txID string) error {
 	tx.mu.Unlock()
 
 	now := time.Now().UTC()
+	var txWrites []TxWrite
 
-	type opMeta struct {
-		op       WriteOperation
-		oldValue []byte
+	// Estructura temporal para recordar qué actualizar en los índices RAM después
+	type meta struct {
+		op            WriteOperation
+		oldValue      []byte
+		enrichedValue []byte
 	}
-	metaList := make([]opMeta, 0, len(writeSetToProcess))
+	metaList := make([]meta, 0, len(writeSetToProcess))
 
-	err := GlobalDB.Update(func(dbTx *bbolt.Tx) error {
+	// --- FASE 1: PRE-PROCESAMIENTO OPTIMISTA (Sin bloquear el disco) ---
+	err := GlobalDB.View(func(dbTx *bbolt.Tx) error {
 		for _, op := range writeSetToProcess {
-			b, err := dbTx.CreateBucketIfNotExists([]byte(op.Collection))
-			if err != nil {
-				return err
-			}
-
 			var oldVal []byte
-			if existingRecordBytes := b.Get([]byte(op.Key)); existingRecordBytes != nil {
-				var rec ItemRecord
-				if bson.Unmarshal(existingRecordBytes, &rec) == nil {
-					oldVal = rec.Value
+			b := dbTx.Bucket([]byte(op.Collection))
+			if b != nil {
+				if existingBytes := b.Get([]byte(op.Key)); existingBytes != nil {
+					var rec ItemRecord
+					if bson.Unmarshal(existingBytes, &rec) == nil {
+						oldVal = rec.Value
+					}
 				}
 			}
 
+			// Validaciones lógicas iniciales
 			if op.OpType == OpTypeSet && oldVal != nil {
 				return fmt.Errorf("commit failed: key '%s' already exists in '%s'", op.Key, op.Collection)
 			}
@@ -177,32 +180,41 @@ func (tm *TransactionManager) Commit(txID string) error {
 				return fmt.Errorf("commit failed: key '%s' does not exist in '%s'", op.Key, op.Collection)
 			}
 
-			metaList = append(metaList, opMeta{op: op, oldValue: oldVal})
+			m := meta{op: op, oldValue: oldVal}
 
-			if op.OpType == OpTypeDelete {
-				if err := b.Delete([]byte(op.Key)); err != nil {
-					return err
-				}
-			} else {
+			// Parseo y ensamblaje de BSON en RAM (Evita ralentizar el Batcher)
+			if op.OpType != OpTypeDelete {
 				var data bson.M
 				bson.Unmarshal(op.Value, &data)
 				data[globalconst.UPDATED_AT] = now
 				if oldVal == nil {
 					data[globalconst.CREATED_AT] = now
 				}
-				enrichedValue, _ := bson.Marshal(data)
 
-				rec := ItemRecord{
-					Value:     enrichedValue,
-					CreatedAt: now,
-				}
+				enrichedValue, _ := bson.Marshal(data)
+				m.enrichedValue = enrichedValue
+
+				// Estructura persistente final
+				rec := ItemRecord{Value: enrichedValue, CreatedAt: now}
 				recBytes, _ := bson.Marshal(rec)
 
-				if err := b.Put([]byte(op.Key), recBytes); err != nil {
-					return err
-				}
-				metaList[len(metaList)-1].op.Value = enrichedValue
+				txWrites = append(txWrites, TxWrite{
+					Collection:   []byte(op.Collection),
+					Key:          []byte(op.Key),
+					Value:        recBytes,
+					IsDelete:     false,
+					MustExist:    op.OpType == OpTypeUpdate,
+					MustNotExist: op.OpType == OpTypeSet,
+				})
+			} else {
+				txWrites = append(txWrites, TxWrite{
+					Collection: []byte(op.Collection),
+					Key:        []byte(op.Key),
+					IsDelete:   true,
+					MustExist:  true,
+				})
 			}
+			metaList = append(metaList, m)
 		}
 		return nil
 	})
@@ -212,20 +224,28 @@ func (tm *TransactionManager) Commit(txID string) error {
 		return err
 	}
 
-	for _, meta := range metaList {
-		col := tm.cm.GetCollection(meta.op.Collection)
+	// --- FASE 2: DELEGACIÓN AL WRITE BATCHER ---
+	err = GlobalBatcher.SubmitTx(txWrites)
+	if err != nil {
+		tm.Rollback(txID)
+		return err
+	}
+
+	// --- FASE 3: ACTUALIZAR ÍNDICES EN RAM POST-COMMIT ---
+	for _, m := range metaList {
+		col := tm.cm.GetCollection(m.op.Collection)
 		if ds, ok := col.(*DiskStore); ok {
 			indexedFields := ds.indexes.ListIndexes()
 			var oldDataForIndex, newDataForIndex map[string]any
 
-			if meta.oldValue != nil {
-				oldDataForIndex = extractIndexedValues(meta.oldValue, indexedFields)
+			if m.oldValue != nil {
+				oldDataForIndex = extractIndexedValues(m.oldValue, indexedFields)
 			}
-			if meta.op.OpType != OpTypeDelete {
-				newDataForIndex = extractIndexedValues(meta.op.Value, indexedFields)
+			if m.op.OpType != OpTypeDelete {
+				newDataForIndex = extractIndexedValues(m.enrichedValue, indexedFields)
 			}
 
-			ds.indexes.Update(meta.op.Key, oldDataForIndex, newDataForIndex)
+			ds.indexes.Update(m.op.Key, oldDataForIndex, newDataForIndex)
 		}
 	}
 
@@ -233,7 +253,7 @@ func (tm *TransactionManager) Commit(txID string) error {
 	delete(tm.transactions, txID)
 	tm.mu.Unlock()
 
-	slog.Info("Transaction successfully committed to disk", "txID", txID, "ops_count", len(metaList))
+	slog.Info("Transaction successfully committed to disk via Group Commit", "txID", txID, "ops_count", len(metaList))
 	return nil
 }
 

@@ -51,12 +51,28 @@ func CloseDiskEngine() error {
 // WRITE BATCHER (GROUP COMMIT)
 // =========================================================
 
+// TxWrite define una operación atómica dentro de una transacción
+type TxWrite struct {
+	Collection   []byte
+	Key          []byte
+	Value        []byte
+	IsDelete     bool
+	MustExist    bool // Validación rápida Anti-Race Condition
+	MustNotExist bool
+}
+
 type BatchOp struct {
+	// Para operaciones simples (High-Speed Lane)
 	Collection []byte
 	Key        []byte
 	Value      []byte
 	IsDelete   bool
-	Done       chan error // Canal para avisarle a la gorutina que ya se guardó seguro
+
+	// Para transacciones (Atomic Bundle)
+	IsTx     bool
+	TxWrites []TxWrite
+
+	Done chan error // Canal para avisarle a la gorutina que ya se guardó seguro
 }
 
 type WriteBatcher struct {
@@ -66,7 +82,7 @@ type WriteBatcher struct {
 
 func NewWriteBatcher() *WriteBatcher {
 	return &WriteBatcher{
-		ops:  make(chan *BatchOp, 50000), // Buffer masivo para el Quincena Rush
+		ops:  make(chan *BatchOp, 50000), // Buffer masivo para alta concurrencia (Quincena Rush)
 		quit: make(chan struct{}),
 	}
 }
@@ -106,24 +122,73 @@ func (wb *WriteBatcher) commitBatch(batch []*BatchOp) {
 	// UNA SOLA transacción ACID física en el disco duro para cientos de peticiones
 	err := GlobalDB.Update(func(tx *bbolt.Tx) error {
 		for _, op := range batch {
-			b := tx.Bucket(op.Collection)
-			if b != nil {
-				if op.IsDelete {
-					b.Delete(op.Key)
-				} else {
-					b.Put(op.Key, op.Value)
+			if op.IsTx {
+				// 1. VALIDACIÓN ULTRA RÁPIDA (Dentro del cerrojo de bbolt)
+				var txErr error
+				for _, write := range op.TxWrites {
+					b, err := tx.CreateBucketIfNotExists(write.Collection)
+					if err != nil {
+						txErr = fmt.Errorf("failed to ensure bucket '%s': %w", write.Collection, err)
+						break
+					}
+
+					exists := b.Get(write.Key) != nil
+
+					if write.MustNotExist && exists {
+						txErr = fmt.Errorf("transaction aborted: key conflict on '%s'", write.Key)
+						break
+					}
+					if write.MustExist && !exists {
+						txErr = fmt.Errorf("transaction aborted: key missing '%s'", write.Key)
+						break
+					}
 				}
+
+				// Si una validación falla, fallamos ESTA transacción, pero salvamos el resto del Batch
+				if txErr != nil {
+					op.Done <- txErr
+					continue
+				}
+
+				// 2. MUTACIÓN (Garantizada y atómica)
+				for _, write := range op.TxWrites {
+					b := tx.Bucket(write.Collection)
+					if write.IsDelete {
+						b.Delete(write.Key)
+					} else {
+						b.Put(write.Key, write.Value)
+					}
+				}
+				op.Done <- nil // Transacción Exitosa
+
+			} else {
+				// Lógica de Operación Simple (Single Write)
+				b, err := tx.CreateBucketIfNotExists(op.Collection)
+				if err == nil && b != nil {
+					if op.IsDelete {
+						b.Delete(op.Key)
+					} else {
+						b.Put(op.Key, op.Value)
+					}
+				}
+				op.Done <- err
 			}
 		}
 		return nil
 	})
 
-	// Una vez seguro en el disco (fsync), despertamos a todas las gorutinas del cliente
-	for _, op := range batch {
-		op.Done <- err
+	// Si todo el bbolt Update falló por un error catastrófico de disco (muy raro), avisamos a todos
+	if err != nil {
+		for _, op := range batch {
+			select {
+			case op.Done <- err:
+			default:
+			}
+		}
 	}
 }
 
+// Submit manda una operación individual al batcher (Mantenemos retrocompatibilidad)
 func (wb *WriteBatcher) Submit(col, key, val []byte, isDel bool) error {
 	done := make(chan error, 1)
 	wb.ops <- &BatchOp{
@@ -134,4 +199,15 @@ func (wb *WriteBatcher) Submit(col, key, val []byte, isDel bool) error {
 		Done:       done,
 	}
 	return <-done // Gorutina en pausa hasta que el disco duro diga OK
+}
+
+// SubmitTx manda un paquete de operaciones atómicas (Transacción) al batcher
+func (wb *WriteBatcher) SubmitTx(ops []TxWrite) error {
+	done := make(chan error, 1)
+	wb.ops <- &BatchOp{
+		IsTx:     true,
+		TxWrites: ops,
+		Done:     done,
+	}
+	return <-done
 }

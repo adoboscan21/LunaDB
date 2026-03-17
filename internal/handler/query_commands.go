@@ -461,22 +461,22 @@ func (h *ConnectionHandler) processCollectionQuery(collectionName string, query 
 	if len(query.Lookups) > 0 {
 		for _, lookupSpec := range query.Lookups {
 			foreignColStore := h.CollectionManager.GetCollection(lookupSpec.FromCollection)
-			hasIndex := foreignColStore != nil && foreignColStore.HasIndex(lookupSpec.ForeignField)
-
-			if !hasIndex {
+			if foreignColStore == nil || !foreignColStore.HasIndex(lookupSpec.ForeignField) {
 				for i := range finalDocs {
 					finalDocs[i][lookupSpec.As] = nil
 				}
 				continue
 			}
 
-			localCache := make(map[any]any)
 			isFlatKey := !strings.Contains(lookupSpec.LocalField, ".")
+
+			// 1. Fase Build: Recolectar todas las llaves foráneas requeridas
+			neededForeignKeysMap := make(map[string]struct{})
+			localToForeignMap := make(map[any]string)
 
 			for i := range finalDocs {
 				var localVal any
 				var ok bool
-
 				if isFlatKey {
 					localVal, ok = finalDocs[i][lookupSpec.LocalField]
 				} else {
@@ -484,28 +484,38 @@ func (h *ConnectionHandler) processCollectionQuery(collectionName string, query 
 				}
 
 				if ok && localVal != nil {
-					var cacheKey any
-					switch v := localVal.(type) {
-					case string, int, int32, int64, float64, float32, bool:
-						cacheKey = v
-					default:
-						cacheKey = fmt.Sprintf("%v", v)
+					// Buscar en el índice de la RAM
+					if fKeys, found := foreignColStore.Lookup(lookupSpec.ForeignField, localVal); found && len(fKeys) > 0 {
+						foreignId := fKeys[0] // Tomamos el primer match (One-to-One / Many-to-One)
+						neededForeignKeysMap[foreignId] = struct{}{}
+						localToForeignMap[localVal] = foreignId
 					}
+				}
+			}
 
-					if cachedDoc, exists := localCache[cacheKey]; exists {
-						finalDocs[i][lookupSpec.As] = cachedDoc
-						continue
-					}
+			// 2. Fase Fetch: Una sola petición masiva al disco duro
+			var foreignIds []string
+			for id := range neededForeignKeysMap {
+				foreignIds = append(foreignIds, id)
+			}
+			foreignDocsBytes := foreignColStore.GetMany(foreignIds)
 
-					if keys, found := foreignColStore.Lookup(lookupSpec.ForeignField, localVal); found && len(keys) > 0 {
-						if fBytes, existsInForeign := foreignColStore.Get(keys[0]); existsInForeign {
-							rawForeign := bson.Raw(fBytes)
-							finalDocs[i][lookupSpec.As] = rawForeign
-							localCache[cacheKey] = rawForeign
+			// 3. Fase Probe: Ensamblar los documentos O(1)
+			for i := range finalDocs {
+				var localVal any
+				if isFlatKey {
+					localVal, _ = finalDocs[i][lookupSpec.LocalField]
+				} else {
+					localVal, _ = getNestedValue(finalDocs[i], lookupSpec.LocalField)
+				}
+
+				if localVal != nil {
+					if foreignId, mapped := localToForeignMap[localVal]; mapped {
+						if fBytes, exists := foreignDocsBytes[foreignId]; exists {
+							finalDocs[i][lookupSpec.As] = bson.Raw(fBytes)
 							continue
 						}
 					}
-					localCache[cacheKey] = nil
 				}
 				finalDocs[i][lookupSpec.As] = nil
 			}
@@ -1742,7 +1752,7 @@ func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *
 	groups := make(map[string]*aggAccumulator)
 	keyBuffer := make([]byte, 0, 128)
 
-	// Leemos directo del disco con Zero-Copy y procesamos al instante
+	// 🚀 Leemos directo del disco con Zero-Copy y procesamos al instante
 	colStore.StreamAll(func(k string, vBytes []byte) bool {
 		item := bson.Raw(vBytes)
 		keyBuffer = keyBuffer[:0]
@@ -1754,6 +1764,7 @@ func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *
 				if i > 0 {
 					keyBuffer = append(keyBuffer, '|')
 				}
+				// 🚀 Lectura O(1) directo de los bytes, sin crear un map[string]any
 				val, err := item.LookupErr(parsedGroupPaths[i]...)
 				if err == nil && val.Type != bsontype.Null {
 					keyBuffer = append(keyBuffer, byte(val.Type))
@@ -1764,11 +1775,11 @@ func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *
 			}
 		}
 
-		// 🔥 ZERO-ALLOCATION FAST PATH
-		acc, exists := groups[string(keyBuffer)]
+		// 🔥 ZERO-ALLOCATION FAST PATH: string(keyBuffer) es la única allocation
+		groupStrKey := string(keyBuffer)
+		acc, exists := groups[groupStrKey]
 
 		if !exists {
-			groupStrKey := string(keyBuffer) // Solo asignamos RAM 1 vez por grupo
 			groupVals := make([]any, len(query.GroupBy))
 			if len(query.GroupBy) > 0 {
 				for i := range query.GroupBy {
@@ -1799,6 +1810,7 @@ func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *
 				continue
 			}
 
+			// 🚀 Extracción cruda: saltamos la decodificación completa del documento
 			val, err := item.LookupErr(op.ParsedPath...)
 			if err != nil || val.Type == bsontype.Null {
 				continue
@@ -1809,7 +1821,7 @@ func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *
 				continue
 			}
 
-			// 🔥 MATEMÁTICA SIN REFLEXIÓN (Directo de los bytes)
+			// 🔥 MATEMÁTICA DIRECTA DESDE LOS BYTES
 			var num float64
 			isNum := true
 			switch val.Type {
