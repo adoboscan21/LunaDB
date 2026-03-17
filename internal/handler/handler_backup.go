@@ -1,3 +1,7 @@
+/* ==========================================================
+   Ruta y Archivo: ./internal/handler/handler_backup.go
+   ========================================================== */
+
 package handler
 
 import (
@@ -16,7 +20,7 @@ import (
 )
 
 // handleBackup maneja el comando para un backup manual.
-// Gracias a bbolt, esto se hace en caliente (Hot Backup) sin bloquear la base de datos.
+// Realiza un volcado en caliente (Hot Backup) de TODAS las particiones físicas (shards).
 func (h *ConnectionHandler) handleBackup(r io.Reader, conn net.Conn) {
 	remoteAddr := "recovery"
 	if conn != nil {
@@ -31,51 +35,73 @@ func (h *ConnectionHandler) handleBackup(r io.Reader, conn net.Conn) {
 		return
 	}
 
-	slog.Info("Manual backup initiated", "user", h.AuthenticatedUser, "remote_addr", remoteAddr)
+	slog.Info("Manual sharded backup initiated", "user", h.AuthenticatedUser, "remote_addr", remoteAddr)
 
-	// 1. Crear directorio de backups si no existe
-	backupDir := "backups"
-	if err := os.MkdirAll(backupDir, 0755); err != nil {
+	// 1. Crear directorio base de backups si no existe
+	baseBackupDir := "backups"
+	if err := os.MkdirAll(baseBackupDir, 0755); err != nil {
 		slog.Error("Failed to create backups directory", "error", err)
-		protocol.WriteResponse(conn, protocol.StatusError, "ERROR: Failed to create backups directory.", nil)
-		return
-	}
-
-	// 2. Generar nombre de archivo único
-	fileName := fmt.Sprintf("lunadb_backup_%s.db", time.Now().Format("20060102_150405"))
-	backupPath := filepath.Join(backupDir, fileName)
-
-	file, err := os.Create(backupPath)
-	if err != nil {
-		slog.Error("Failed to create backup file", "error", err)
-		protocol.WriteResponse(conn, protocol.StatusError, "ERROR: Failed to create backup file.", nil)
-		return
-	}
-	defer file.Close()
-
-	// 3. Volcado nativo de bbolt (Hot Backup)
-	err = store.GlobalDB.View(func(tx *bbolt.Tx) error {
-		_, writeErr := tx.WriteTo(file)
-		return writeErr
-	})
-
-	if err != nil {
-		slog.Error("Manual backup failed during WriteTo", "user", h.AuthenticatedUser, "error", err)
-		os.Remove(backupPath) // Limpiar archivo corrupto
 		if conn != nil {
-			protocol.WriteResponse(conn, protocol.StatusError, fmt.Sprintf("ERROR: Backup failed: %v", err), nil)
+			protocol.WriteResponse(conn, protocol.StatusError, "ERROR: Failed to create backups directory.", nil)
 		}
 		return
 	}
 
-	slog.Info("Manual backup completed successfully", "user", h.AuthenticatedUser, "file", fileName)
+	// 2. Crear una CARPETA específica para este backup (ya que ahora son múltiples archivos)
+	backupName := fmt.Sprintf("lunadb_backup_%s", time.Now().Format("20060102_150405"))
+	backupDirPath := filepath.Join(baseBackupDir, backupName)
+
+	if err := os.MkdirAll(backupDirPath, 0755); err != nil {
+		slog.Error("Failed to create specific backup directory", "error", err)
+		if conn != nil {
+			protocol.WriteResponse(conn, protocol.StatusError, "ERROR: Failed to create specific backup directory.", nil)
+		}
+		return
+	}
+
+	// 3. Volcado nativo de bbolt (Hot Backup) iterando sobre todos los Shards
+	var backupErr error
+	for i := 0; i < store.TotalShards; i++ {
+		shardFileName := fmt.Sprintf("shard_%d.db", i)
+		shardFilePath := filepath.Join(backupDirPath, shardFileName)
+
+		file, err := os.Create(shardFilePath)
+		if err != nil {
+			backupErr = fmt.Errorf("failed to create backup file for shard %d: %w", i, err)
+			break
+		}
+
+		// Copia en caliente directa desde el motor de la partición actual
+		err = store.GlobalDBs[i].View(func(tx *bbolt.Tx) error {
+			_, writeErr := tx.WriteTo(file)
+			return writeErr
+		})
+
+		file.Close()
+
+		if err != nil {
+			backupErr = fmt.Errorf("failed to write backup for shard %d: %w", i, err)
+			break
+		}
+	}
+
+	if backupErr != nil {
+		slog.Error("Manual backup failed", "user", h.AuthenticatedUser, "error", backupErr)
+		os.RemoveAll(backupDirPath) // Limpiar la carpeta corrupta/incompleta
+		if conn != nil {
+			protocol.WriteResponse(conn, protocol.StatusError, fmt.Sprintf("ERROR: Backup failed: %v", backupErr), nil)
+		}
+		return
+	}
+
+	slog.Info("Manual sharded backup completed successfully", "user", h.AuthenticatedUser, "folder", backupName)
 	if conn != nil {
-		protocol.WriteResponse(conn, protocol.StatusOk, fmt.Sprintf("OK: Manual backup completed successfully. Saved as '%s'.", fileName), nil)
+		protocol.WriteResponse(conn, protocol.StatusOk, fmt.Sprintf("OK: Manual backup completed successfully. Saved in folder '%s'.", backupName), nil)
 	}
 }
 
 // HandleRestore maneja el comando para restaurar desde un backup.
-// Implementamos un "Hot Restore" lógico: limpiamos los buckets físicos actuales y copiamos los del backup.
+// Implementa un "Hot Restore" en todas las particiones simultáneamente.
 func (h *ConnectionHandler) HandleRestore(r io.Reader, conn net.Conn) {
 	remoteAddr := "recovery"
 	if conn != nil {
@@ -105,98 +131,117 @@ func (h *ConnectionHandler) HandleRestore(r io.Reader, conn net.Conn) {
 		return
 	}
 
-	backupPath := filepath.Join("backups", backupName)
-	if _, err := os.Stat(backupPath); os.IsNotExist(err) {
-		protocol.WriteResponse(conn, protocol.StatusNotFound, fmt.Sprintf("ERROR: Backup file '%s' not found.", backupName), nil)
+	backupDirPath := filepath.Join("backups", backupName)
+	info, err := os.Stat(backupDirPath)
+	if os.IsNotExist(err) || !info.IsDir() {
+		if conn != nil {
+			protocol.WriteResponse(conn, protocol.StatusNotFound, fmt.Sprintf("ERROR: Backup folder '%s' not found.", backupName), nil)
+		}
 		return
 	}
 
-	slog.Warn("DESTRUCTIVE ACTION: Hot Restore initiated", "user", h.AuthenticatedUser, "backup_name", backupName, "remote_addr", remoteAddr)
-
-	// 1. Abrir la base de datos de backup en modo Solo-Lectura
-	backupDB, err := bbolt.Open(backupPath, 0600, &bbolt.Options{ReadOnly: true})
-	if err != nil {
-		slog.Error("Failed to open backup DB file", "error", err)
-		protocol.WriteResponse(conn, protocol.StatusError, "ERROR: Could not read backup file. It might be corrupted.", nil)
-		return
+	// Validación de seguridad: Validar que el backup tenga los mismos shards que la base de datos activa
+	for i := 0; i < store.TotalShards; i++ {
+		shardFilePath := filepath.Join(backupDirPath, fmt.Sprintf("shard_%d.db", i))
+		if _, err := os.Stat(shardFilePath); os.IsNotExist(err) {
+			errMsg := fmt.Errorf("backup folder does not contain 'shard_%d.db'. Ensure the backup was made with NumShards=%d", i, store.TotalShards)
+			slog.Error("Restore validation failed", "error", errMsg)
+			if conn != nil {
+				protocol.WriteResponse(conn, protocol.StatusError, fmt.Sprintf("ERROR: %v", errMsg), nil)
+			}
+			return
+		}
 	}
-	defer backupDB.Close()
 
-	// 2. CORRECCIÓN: Borrar TODO el contenido físico de la base de datos actual.
-	err = store.GlobalDB.Update(func(tx *bbolt.Tx) error {
-		// Recopilamos los nombres de todos los buckets actuales
-		var bucketsToDelete [][]byte
-		tx.ForEach(func(name []byte, _ *bbolt.Bucket) error {
-			bucketsToDelete = append(bucketsToDelete, name)
+	slog.Warn("DESTRUCTIVE ACTION: Hot Sharded Restore initiated", "user", h.AuthenticatedUser, "backup_name", backupName, "remote_addr", remoteAddr)
+
+	// 1. Borrar TODO el contenido físico de TODAS las particiones actuales.
+	for i := 0; i < store.TotalShards; i++ {
+		err = store.GlobalDBs[i].Update(func(tx *bbolt.Tx) error {
+			var bucketsToDelete [][]byte
+			tx.ForEach(func(name []byte, _ *bbolt.Bucket) error {
+				bucketsToDelete = append(bucketsToDelete, name)
+				return nil
+			})
+			for _, name := range bucketsToDelete {
+				if err := tx.DeleteBucket(name); err != nil {
+					return err
+				}
+			}
 			return nil
 		})
-		// Los eliminamos físicamente
-		for _, name := range bucketsToDelete {
-			if err := tx.DeleteBucket(name); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
 
-	if err != nil {
-		slog.Error("Failed to wipe current database for restore", "error", err)
-		protocol.WriteResponse(conn, protocol.StatusError, "ERROR: Could not wipe current database.", nil)
-		return
+		if err != nil {
+			slog.Error("Failed to wipe current database shard for restore", "shard", i, "error", err)
+			if conn != nil {
+				protocol.WriteResponse(conn, protocol.StatusError, "ERROR: Could not wipe current database shards.", nil)
+			}
+			return
+		}
 	}
 
-	// Limpiar referencias en la memoria RAM
+	// 2. Limpiar referencias en la memoria RAM
 	currentCollections := h.CollectionManager.ListCollections()
 	for _, colName := range currentCollections {
-		// Usamos un helper interno o simplemente ignoramos,
-		// InitializeFromDisk reescribirá la RAM correctamente.
 		h.CollectionManager.DeleteCollection(colName)
 	}
 	slog.Info("Live collections wiped successfully for restore.")
 
-	// 3. Copiar todos los Buckets del Backup a la Base de Datos Viva
-	err = backupDB.View(func(btx *bbolt.Tx) error {
-		return store.GlobalDB.Update(func(gtx *bbolt.Tx) error {
-			return btx.ForEach(func(name []byte, b *bbolt.Bucket) error {
-				// Crear el bucket en la BD activa
-				newB, err := gtx.CreateBucketIfNotExists(name)
-				if err != nil {
-					return err
-				}
-				// Copiar llave por llave
-				return b.ForEach(func(k, v []byte) error {
-					return newB.Put(k, v)
+	// 3. Copiar todos los Buckets del Backup a la Base de Datos Viva, Shard por Shard
+	for i := 0; i < store.TotalShards; i++ {
+		shardFilePath := filepath.Join(backupDirPath, fmt.Sprintf("shard_%d.db", i))
+
+		// Abrir la base de datos de backup en modo Solo-Lectura
+		backupDB, err := bbolt.Open(shardFilePath, 0600, &bbolt.Options{ReadOnly: true})
+		if err != nil {
+			slog.Error("Failed to open backup shard DB file", "shard", i, "error", err)
+			if conn != nil {
+				protocol.WriteResponse(conn, protocol.StatusError, fmt.Sprintf("ERROR: Could not read backup shard %d. Corrupted?", i), nil)
+			}
+			return
+		}
+
+		err = backupDB.View(func(btx *bbolt.Tx) error {
+			return store.GlobalDBs[i].Update(func(gtx *bbolt.Tx) error {
+				return btx.ForEach(func(name []byte, b *bbolt.Bucket) error {
+					newB, err := gtx.CreateBucketIfNotExists(name)
+					if err != nil {
+						return err
+					}
+					return b.ForEach(func(k, v []byte) error {
+						return newB.Put(k, v)
+					})
 				})
 			})
 		})
-	})
 
-	if err != nil {
-		slog.Error("Restore failed during data transfer", "backup_name", backupName, "error", err)
-		if conn != nil {
-			protocol.WriteResponse(conn, protocol.StatusError, fmt.Sprintf("ERROR: Restore failed during data copy: %v", err), nil)
+		backupDB.Close()
+
+		if err != nil {
+			slog.Error("Restore failed during data transfer", "shard", i, "backup_name", backupName, "error", err)
+			if conn != nil {
+				protocol.WriteResponse(conn, protocol.StatusError, fmt.Sprintf("ERROR: Restore failed during data copy on shard %d: %v", i, err), nil)
+			}
+			return
 		}
-		return
 	}
 
 	// 4. Reconstruir la RAM
-	// Primero, obligamos al CollectionManager a registrar los Buckets recién restaurados
-	// llamando a GetCollection (que los instancia en RAM si existen en disco).
-	restoredNames := h.CollectionManager.ListCollections()
-	for _, name := range restoredNames {
-		h.CollectionManager.GetCollection(name)
-	}
+	// Primero, instanciamos en RAM todo lo que acabamos de copiar a disco.
+	// Nota: Ya no podemos usar ListCollections() si no los hemos registrado.
+	// Haremos que InitializeFromDisk busque en los discos para levantar todo.
 
-	// Ahora sí, poblamos los Árboles B de esos DiskStores
 	if err := h.CollectionManager.InitializeFromDisk(); err != nil {
 		slog.Error("Failed to rebuild indexes after restore", "error", err)
-		protocol.WriteResponse(conn, protocol.StatusError, "ERROR: Data restored but index rebuild failed. Restart recommended.", nil)
+		if conn != nil {
+			protocol.WriteResponse(conn, protocol.StatusError, "ERROR: Data restored but index rebuild failed. Restart recommended.", nil)
+		}
 		return
 	}
 
 	slog.Info("Restore completed successfully", "backup_name", backupName, "user", h.AuthenticatedUser)
 	if conn != nil {
-		msg := fmt.Sprintf("OK: Restore from '%s' completed successfully. All indexes are hot and ready.", backupName)
+		msg := fmt.Sprintf("OK: Restore from folder '%s' completed successfully. All shards and indexes are hot and ready.", backupName)
 		protocol.WriteResponse(conn, protocol.StatusOk, msg, nil)
 	}
 }

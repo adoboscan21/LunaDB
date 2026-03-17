@@ -9,20 +9,23 @@ import (
 	"go.mongodb.org/mongo-driver/bson/bsontype"
 )
 
-// DiskStore implementa DataStore usando bbolt.
+// DiskStore implementa DataStore usando bbolt particionado.
 type DiskStore struct {
 	collectionName []byte
 	indexes        *IndexManager
 }
 
-// NewDiskStore inicializa el acceso a una colección en disco.
+// NewDiskStore inicializa el acceso a una colección asegurando que exista en todos los shards.
 func NewDiskStore(name string) *DiskStore {
 	colName := []byte(name)
 
-	GlobalDB.Update(func(tx *bbolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(colName)
-		return err
-	})
+	// Debemos asegurarnos de que el Bucket exista en TODAS las particiones físicas
+	for i := 0; i < TotalShards; i++ {
+		GlobalDBs[i].Update(func(tx *bbolt.Tx) error {
+			_, err := tx.CreateBucketIfNotExists(colName)
+			return err
+		})
+	}
 
 	return &DiskStore{
 		collectionName: colName,
@@ -30,8 +33,11 @@ func NewDiskStore(name string) *DiskStore {
 	}
 }
 
-// Set guarda o actualiza un documento en la base de datos persistente.
+// Set guarda o actualiza un documento ruteándolo a su partición (shard) correspondiente.
 func (s *DiskStore) Set(key string, value []byte) {
+	shardID := GetShardID(key, TotalShards)
+	batcher := GlobalBatchers[shardID]
+
 	record := ItemRecord{
 		Value:     value,
 		CreatedAt: time.Now(),
@@ -43,14 +49,14 @@ func (s *DiskStore) Set(key string, value []byte) {
 		return
 	}
 
-	// 🔥 OPTIMIZADO: Enviamos al Batcher y esperamos la confirmación segura
-	err = GlobalBatcher.Submit(s.collectionName, []byte(key), recordBytes, false)
+	// Enviamos al Batcher específico de este shard
+	err = batcher.Submit(s.collectionName, []byte(key), recordBytes, false)
 	if err != nil {
 		slog.Error("Failed to write to disk batch", "key", key, "error", err)
 		return
 	}
 
-	// Solo actualizamos el índice en RAM si el disco guardó con éxito
+	// Actualizamos el índice en RAM
 	indexedFields := s.indexes.ListIndexes()
 	newDataForIndex := extractIndexedValues(value, indexedFields)
 	if newDataForIndex != nil {
@@ -58,39 +64,55 @@ func (s *DiskStore) Set(key string, value []byte) {
 	}
 }
 
-// SetMany guarda múltiples ítems en una sola transacción ACID (Bulk Insert)
+// SetMany guarda múltiples ítems agrupándolos por partición.
 func (s *DiskStore) SetMany(items map[string][]byte) {
 	now := time.Now()
 	indexUpdates := make(map[string]map[string]any, len(items))
 	indexedFields := s.indexes.ListIndexes()
 
-	// Única transacción física para todos los ítems
-	GlobalDB.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(s.collectionName)
-		for key, value := range items {
-			record := ItemRecord{Value: value, CreatedAt: now}
-			recordBytes, _ := bson.Marshal(record)
-			b.Put([]byte(key), recordBytes)
-
-			if newDataForIndex := extractIndexedValues(value, indexedFields); newDataForIndex != nil {
-				indexUpdates[key] = newDataForIndex
-			}
+	// 1. Agrupar ítems por Shard
+	shardItems := make(map[int]map[string][]byte)
+	for key, value := range items {
+		shardID := GetShardID(key, TotalShards)
+		if shardItems[shardID] == nil {
+			shardItems[shardID] = make(map[string][]byte)
 		}
-		return nil
-	})
+		shardItems[shardID][key] = value
+	}
 
-	// Actualización de índices en RAM
+	// 2. Escribir en disco por cada Shard de manera atómica local
+	for shardID, sItems := range shardItems {
+		db := GlobalDBs[shardID]
+		db.Update(func(tx *bbolt.Tx) error {
+			b := tx.Bucket(s.collectionName)
+			for key, value := range sItems {
+				record := ItemRecord{Value: value, CreatedAt: now}
+				recordBytes, _ := bson.Marshal(record)
+				b.Put([]byte(key), recordBytes)
+
+				if newDataForIndex := extractIndexedValues(value, indexedFields); newDataForIndex != nil {
+					indexUpdates[key] = newDataForIndex
+				}
+			}
+			return nil
+		})
+	}
+
+	// 3. Actualización de índices en RAM
 	for key, data := range indexUpdates {
 		s.indexes.Update(key, nil, data)
 	}
 }
 
-// Delete borra usando Update directo para soportar alta velocidad en peticiones individuales
+// Delete borra un registro apuntando directamente a la partición correcta.
 func (s *DiskStore) Delete(key string) {
 	oldValue, found := s.Get(key)
 
-	// 🔥 OPTIMIZADO: Eliminación en Lote
-	err := GlobalBatcher.Submit(s.collectionName, []byte(key), nil, true)
+	shardID := GetShardID(key, TotalShards)
+	batcher := GlobalBatchers[shardID]
+
+	// Eliminación ruteada
+	err := batcher.Submit(s.collectionName, []byte(key), nil, true)
 	if err != nil {
 		slog.Error("Failed to delete from disk batch", "key", key, "error", err)
 		return
@@ -105,42 +127,56 @@ func (s *DiskStore) Delete(key string) {
 	}
 }
 
-// DeleteMany borra múltiples ítems en una sola transacción ACID (Bulk Delete)
+// DeleteMany borra múltiples ítems agrupándolos por partición.
 func (s *DiskStore) DeleteMany(keys []string) {
 	oldDatas := make(map[string]map[string]any, len(keys))
 	indexedFields := s.indexes.ListIndexes()
 
-	GlobalDB.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(s.collectionName)
-		if b == nil {
-			return nil
-		}
-		for _, k := range keys {
-			kb := []byte(k)
-			// 🔥 Lectura ultra rápida DENTRO de la misma transacción (Evita N+1 transactions)
-			if oldVal := b.Get(kb); oldVal != nil {
-				var record ItemRecord
-				if err := bson.Unmarshal(oldVal, &record); err == nil {
-					if oldDataForIndex := extractIndexedValues(record.Value, indexedFields); oldDataForIndex != nil {
-						oldDatas[k] = oldDataForIndex
+	// 1. Agrupar llaves por Shard
+	shardKeys := make(map[int][]string)
+	for _, key := range keys {
+		shardID := GetShardID(key, TotalShards)
+		shardKeys[shardID] = append(shardKeys[shardID], key)
+	}
+
+	// 2. Ejecutar borrado partición por partición
+	for shardID, sKeys := range shardKeys {
+		db := GlobalDBs[shardID]
+		db.Update(func(tx *bbolt.Tx) error {
+			b := tx.Bucket(s.collectionName)
+			if b == nil {
+				return nil
+			}
+			for _, k := range sKeys {
+				kb := []byte(k)
+				if oldVal := b.Get(kb); oldVal != nil {
+					var record ItemRecord
+					if err := bson.Unmarshal(oldVal, &record); err == nil {
+						if oldDataForIndex := extractIndexedValues(record.Value, indexedFields); oldDataForIndex != nil {
+							oldDatas[k] = oldDataForIndex
+						}
 					}
 				}
+				b.Delete(kb)
 			}
-			b.Delete(kb)
-		}
-		return nil
-	})
+			return nil
+		})
+	}
 
 	for k, oldData := range oldDatas {
 		s.indexes.Remove(k, oldData)
 	}
 }
 
+// Get lee el documento buscando directamente en el Shard correcto en O(1).
 func (s *DiskStore) Get(key string) ([]byte, bool) {
+	shardID := GetShardID(key, TotalShards)
+	db := GlobalDBs[shardID]
+
 	var valCopy []byte
 	var found bool
 
-	GlobalDB.View(func(tx *bbolt.Tx) error {
+	db.View(func(tx *bbolt.Tx) error {
 		b := tx.Bucket(s.collectionName)
 		if b == nil {
 			return nil
@@ -161,84 +197,136 @@ func (s *DiskStore) Get(key string) ([]byte, bool) {
 	return valCopy, found
 }
 
-func (s *DiskStore) StreamAll(callback func(key string, value []byte) bool) {
-	GlobalDB.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(s.collectionName)
-		if b == nil {
-			return nil
-		}
-		c := b.Cursor()
+// GetMany recupera múltiples ítems agrupando las consultas por partición.
+func (s *DiskStore) GetMany(keys []string) map[string][]byte {
+	res := make(map[string][]byte, len(keys))
 
-		for k, v := c.First(); k != nil; k, v = c.Next() {
-			// 🔥 ZERO-COPY FAST PATH: Leemos el BSON binario sin deserializar el struct
-			raw := bson.Raw(v)
+	// Agrupar llaves por Shard
+	shardKeys := make(map[int][]string)
+	for _, key := range keys {
+		shardID := GetShardID(key, TotalShards)
+		shardKeys[shardID] = append(shardKeys[shardID], key)
+	}
 
-			// Extraemos los bytes puros del documento interior
-			if val := raw.Lookup("v"); val.Type == bsontype.Binary {
-				_, data := val.Binary()
-				if !callback(string(k), data) {
-					break
+	// Consultar partición por partición
+	for shardID, sKeys := range shardKeys {
+		db := GlobalDBs[shardID]
+		db.View(func(tx *bbolt.Tx) error {
+			b := tx.Bucket(s.collectionName)
+			if b == nil {
+				return nil
+			}
+			for _, k := range sKeys {
+				if recordBytes := b.Get([]byte(k)); recordBytes != nil {
+					raw := bson.Raw(recordBytes)
+					if val := raw.Lookup("v"); val.Type == bsontype.Binary {
+						_, data := val.Binary()
+						valCopy := make([]byte, len(data))
+						copy(valCopy, data)
+						res[k] = valCopy
+					}
 				}
 			}
-		}
-		return nil
-	})
+			return nil
+		})
+	}
+
+	return res
 }
 
+// StreamAll itera secuencialmente sobre todas las particiones.
+func (s *DiskStore) StreamAll(callback func(key string, value []byte) bool) {
+	keepGoing := true
+	for i := 0; i < TotalShards; i++ {
+		db := GlobalDBs[i]
+		db.View(func(tx *bbolt.Tx) error {
+			b := tx.Bucket(s.collectionName)
+			if b == nil {
+				return nil
+			}
+			c := b.Cursor()
+
+			for k, v := c.First(); k != nil; k, v = c.Next() {
+				raw := bson.Raw(v)
+				if val := raw.Lookup("v"); val.Type == bsontype.Binary {
+					_, data := val.Binary()
+					if !callback(string(k), data) {
+						keepGoing = false
+						break
+					}
+				}
+			}
+			return nil
+		})
+		if !keepGoing {
+			break
+		}
+	}
+}
+
+// Update actualiza un ítem. Al usar Set, ya rutea automáticamente.
 func (s *DiskStore) Update(key string, newValue []byte) bool {
 	s.Set(key, newValue)
 	return true
 }
 
-// UpdateMany guarda múltiples parches (ya procesados) en una sola transacción ACID
+// UpdateMany actualiza múltiples ítems ruteando las operaciones por partición.
 func (s *DiskStore) UpdateMany(items map[string][]byte) (int, []string) {
 	updatedCount := 0
 	var failedKeys []string
 	indexUpdates := make(map[string]map[string]any, len(items))
 	indexedFields := s.indexes.ListIndexes()
 
-	// 1 sola transacción ACID para miles de actualizaciones
-	GlobalDB.Update(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(s.collectionName)
-		for key, newValue := range items {
-			// Aunque el handler ya hizo el Get, aseguramos que exista en disco
-			existing := b.Get([]byte(key))
-			if existing == nil {
-				failedKeys = append(failedKeys, key)
-				continue
-			}
-
-			// Nota: Aquí se asume que 'newValue' ya es un ItemRecord completo o un BSON crudo.
-			// Lo envolvemos en ItemRecord para mantener compatibilidad persistente.
-			var oldRecord ItemRecord
-			bson.Unmarshal(existing, &oldRecord)
-
-			record := ItemRecord{
-				Value:     newValue,
-				CreatedAt: oldRecord.CreatedAt,
-			}
-			recordBytes, _ := bson.Marshal(record)
-
-			if err := b.Put([]byte(key), recordBytes); err == nil {
-				updatedCount++
-				if newDataForIndex := extractIndexedValues(newValue, indexedFields); newDataForIndex != nil {
-					indexUpdates[key] = newDataForIndex
-				}
-			} else {
-				failedKeys = append(failedKeys, key)
-			}
+	shardItems := make(map[int]map[string][]byte)
+	for key, value := range items {
+		shardID := GetShardID(key, TotalShards)
+		if shardItems[shardID] == nil {
+			shardItems[shardID] = make(map[string][]byte)
 		}
-		return nil
-	})
+		shardItems[shardID][key] = value
+	}
 
-	// Actualizamos RAM de golpe
+	for shardID, sItems := range shardItems {
+		db := GlobalDBs[shardID]
+		db.Update(func(tx *bbolt.Tx) error {
+			b := tx.Bucket(s.collectionName)
+			for key, newValue := range sItems {
+				existing := b.Get([]byte(key))
+				if existing == nil {
+					failedKeys = append(failedKeys, key)
+					continue
+				}
+
+				var oldRecord ItemRecord
+				bson.Unmarshal(existing, &oldRecord)
+
+				record := ItemRecord{
+					Value:     newValue,
+					CreatedAt: oldRecord.CreatedAt,
+				}
+				recordBytes, _ := bson.Marshal(record)
+
+				if err := b.Put([]byte(key), recordBytes); err == nil {
+					updatedCount++
+					if newDataForIndex := extractIndexedValues(newValue, indexedFields); newDataForIndex != nil {
+						indexUpdates[key] = newDataForIndex
+					}
+				} else {
+					failedKeys = append(failedKeys, key)
+				}
+			}
+			return nil
+		})
+	}
+
 	for key, data := range indexUpdates {
-		s.indexes.Update(key, nil, data) // Simplificado: no borra el viejo index, asume sobreescritura
+		s.indexes.Update(key, nil, data)
 	}
 
 	return updatedCount, failedKeys
 }
 
+// === Funciones de Índices (Operan en memoria globalmente) ===
 func (s *DiskStore) CreateIndex(field string)   { s.indexes.CreateIndex(field) }
 func (s *DiskStore) DeleteIndex(field string)   { s.indexes.DeleteIndex(field) }
 func (s *DiskStore) ListIndexes() []string      { return s.indexes.ListIndexes() }
@@ -262,28 +350,3 @@ func (s *DiskStore) GetGroupedCount(field string) (map[any]int, bool) {
 func (s *DiskStore) Size() int                       { return 0 }
 func (s *DiskStore) LoadData(data map[string][]byte) {}
 func (s *DiskStore) GetAll() map[string][]byte       { return nil }
-func (s *DiskStore) GetMany(keys []string) map[string][]byte {
-	res := make(map[string][]byte, len(keys))
-
-	GlobalDB.View(func(tx *bbolt.Tx) error {
-		b := tx.Bucket(s.collectionName)
-		if b == nil {
-			return nil
-		}
-		for _, k := range keys {
-			if recordBytes := b.Get([]byte(k)); recordBytes != nil {
-				// ZERO-COPY FAST PATH: Extraemos el campo 'v' (Value) directo del BSON binario
-				raw := bson.Raw(recordBytes)
-				if val := raw.Lookup("v"); val.Type == bsontype.Binary {
-					_, data := val.Binary()
-					valCopy := make([]byte, len(data))
-					copy(valCopy, data)
-					res[k] = valCopy
-				}
-			}
-		}
-		return nil
-	})
-
-	return res
-}

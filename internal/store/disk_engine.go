@@ -3,48 +3,77 @@ package store
 import (
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"go.etcd.io/bbolt"
 )
 
-var GlobalDB *bbolt.DB
-var GlobalBatcher *WriteBatcher
+// GlobalDBs almacena las conexiones a cada una de las particiones (shards) físicas.
+var GlobalDBs []*bbolt.DB
 
-// InitDiskEngine inicializa la base de datos bbolt y el Batcher.
-func InitDiskEngine(dbPath string) error {
-	slog.Info("Initializing Disk Engine (bbolt)...", "path", dbPath)
+// GlobalBatchers almacena los workers de Group Commit, uno por cada partición.
+var GlobalBatchers []*WriteBatcher
 
-	db, err := bbolt.Open(dbPath, 0600, &bbolt.Options{
-		Timeout: 5 * time.Second,
-		// 🔥 HEMOS QUITADO "NoSync: true".
-		// Ahora bbolt hace 'fsync' físico por cada transacción. 100% seguro contra apagones.
-		NoFreelistSync: true,
-		FreelistType:   bbolt.FreelistMapType, // Mantiene la solución al problema de RAM
-	})
-	if err != nil {
-		return fmt.Errorf("failed to open bbolt database: %w", err)
+// TotalShards guarda la cantidad total de particiones configuradas para uso global.
+var TotalShards int
+
+// InitDiskEngine inicializa las múltiples bases de datos bbolt y sus Batchers correspondientes.
+func InitDiskEngine(basePath string, numShards int) error {
+	slog.Info("Initializing Disk Engine (Sharded bbolt)...", "basePath", basePath, "shards", numShards)
+
+	if numShards <= 0 {
+		numShards = 1 // Protección básica para asegurar al menos una partición
 	}
 
-	GlobalDB = db
+	TotalShards = numShards
+	GlobalDBs = make([]*bbolt.DB, numShards)
+	GlobalBatchers = make([]*WriteBatcher, numShards)
 
-	// Inicializamos el Group Commit Worker
-	GlobalBatcher = NewWriteBatcher()
-	GlobalBatcher.Start()
+	// basePath normalmente es "data/luna.db". Lo separamos para añadir el sufijo de la partición.
+	baseName := strings.TrimSuffix(basePath, ".db")
+
+	for i := 0; i < numShards; i++ {
+		dbPath := fmt.Sprintf("%s_%d.db", baseName, i)
+		db, err := bbolt.Open(dbPath, 0600, &bbolt.Options{
+			Timeout: 5 * time.Second,
+			// Mantenemos la seguridad extrema: bbolt hace 'fsync' físico por cada transacción.
+			NoFreelistSync: true,
+			FreelistType:   bbolt.FreelistMapType,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to open bbolt database shard %d: %w", i, err)
+		}
+
+		GlobalDBs[i] = db
+
+		// Inicializamos un Group Commit Worker EXCLUSIVO para este shard, pasándole su BD específica
+		batcher := NewWriteBatcher(db)
+		GlobalBatchers[i] = batcher
+		batcher.Start()
+	}
 
 	return nil
 }
 
-// CloseDiskEngine cierra la base de datos de forma segura.
+// CloseDiskEngine cierra todas las bases de datos de forma segura.
 func CloseDiskEngine() error {
-	if GlobalBatcher != nil {
-		close(GlobalBatcher.quit)
+	slog.Info("Closing Sharded Disk Engine...")
+	var firstErr error
+
+	for i := 0; i < TotalShards; i++ {
+		// 1. Apagamos el worker para que deje de aceptar operaciones
+		if GlobalBatchers[i] != nil {
+			close(GlobalBatchers[i].quit)
+		}
+		// 2. Cerramos la conexión al archivo físico
+		if GlobalDBs[i] != nil {
+			if err := GlobalDBs[i].Close(); err != nil && firstErr == nil {
+				firstErr = err // Guardamos el primer error para reportarlo, pero seguimos cerrando el resto
+			}
+		}
 	}
-	if GlobalDB != nil {
-		slog.Info("Closing Disk Engine...")
-		return GlobalDB.Close()
-	}
-	return nil
+	return firstErr
 }
 
 // =========================================================
@@ -76,17 +105,21 @@ type BatchOp struct {
 }
 
 type WriteBatcher struct {
+	db   *bbolt.DB // Referencia directa a la base de datos de ESTE shard
 	ops  chan *BatchOp
 	quit chan struct{}
 }
 
-func NewWriteBatcher() *WriteBatcher {
+// NewWriteBatcher crea un nuevo agrupador de escrituras asignado a una base de datos específica.
+func NewWriteBatcher(db *bbolt.DB) *WriteBatcher {
 	return &WriteBatcher{
-		ops:  make(chan *BatchOp, 50000), // Buffer masivo para alta concurrencia (Quincena Rush)
+		db:   db,
+		ops:  make(chan *BatchOp, 50000), // Buffer masivo para alta concurrencia
 		quit: make(chan struct{}),
 	}
 }
 
+// Start arranca la gorutina en segundo plano que agrupa y escribe en el disco.
 func (wb *WriteBatcher) Start() {
 	go func() {
 		var batch []*BatchOp
@@ -118,9 +151,10 @@ func (wb *WriteBatcher) Start() {
 	}()
 }
 
+// commitBatch ejecuta una sola transacción en disco para múltiples operaciones en memoria.
 func (wb *WriteBatcher) commitBatch(batch []*BatchOp) {
-	// UNA SOLA transacción ACID física en el disco duro para cientos de peticiones
-	err := GlobalDB.Update(func(tx *bbolt.Tx) error {
+	// UNA SOLA transacción ACID física en el disco duro (específico de este Shard) para cientos de peticiones
+	err := wb.db.Update(func(tx *bbolt.Tx) error {
 		for _, op := range batch {
 			if op.IsTx {
 				// 1. VALIDACIÓN ULTRA RÁPIDA (Dentro del cerrojo de bbolt)
@@ -188,7 +222,7 @@ func (wb *WriteBatcher) commitBatch(batch []*BatchOp) {
 	}
 }
 
-// Submit manda una operación individual al batcher (Mantenemos retrocompatibilidad)
+// Submit manda una operación individual al batcher de esta partición.
 func (wb *WriteBatcher) Submit(col, key, val []byte, isDel bool) error {
 	done := make(chan error, 1)
 	wb.ops <- &BatchOp{
@@ -201,7 +235,7 @@ func (wb *WriteBatcher) Submit(col, key, val []byte, isDel bool) error {
 	return <-done // Gorutina en pausa hasta que el disco duro diga OK
 }
 
-// SubmitTx manda un paquete de operaciones atómicas (Transacción) al batcher
+// SubmitTx manda un paquete de operaciones atómicas (Transacción) al batcher de esta partición.
 func (wb *WriteBatcher) SubmitTx(ops []TxWrite) error {
 	done := make(chan error, 1)
 	wb.ops <- &BatchOp{

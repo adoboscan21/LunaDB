@@ -71,7 +71,7 @@ func main() {
 	}
 
 	dbPath := filepath.Join("data", "luna.db")
-	if err := store.InitDiskEngine(dbPath); err != nil {
+	if err := store.InitDiskEngine(dbPath, cfg.NumShards); err != nil {
 		slog.Error("Fatal error starting Disk Engine", "error", err)
 		os.Exit(1)
 	}
@@ -193,39 +193,68 @@ func main() {
 		}
 	}()
 
-	// Worker de Backups Automáticos Periódicos
+	// Worker de Backups Automáticos Periódicos (Soporte Sharding)
 	go func() {
 		ticker := time.NewTicker(cfg.BackupInterval)
 		defer ticker.Stop()
-		slog.Info("Starting automated backup worker", "interval", cfg.BackupInterval.String())
+		slog.Info("Starting automated sharded backup worker", "interval", cfg.BackupInterval.String())
 
 		for {
 			select {
 			case <-ticker.C:
-				backupDir := "backups"
-				os.MkdirAll(backupDir, 0755)
-				fileName := fmt.Sprintf("lunadb_auto_%s.db", time.Now().Format("20060102_150405"))
-				backupPath := filepath.Join(backupDir, fileName)
+				baseBackupDir := "backups"
+				os.MkdirAll(baseBackupDir, 0755)
 
-				file, err := os.Create(backupPath)
-				if err == nil {
-					store.GlobalDB.View(func(tx *bbolt.Tx) error {
-						_, err := tx.WriteTo(file)
-						return err
-					})
-					file.Close()
-					slog.Info("Automated backup completed successfully", "file", fileName)
-				} else {
-					slog.Error("Failed to create automated backup file", "error", err)
+				// 1. Crear la carpeta específica para este backup automático
+				folderName := fmt.Sprintf("lunadb_auto_%s", time.Now().Format("20060102_150405"))
+				backupDirPath := filepath.Join(baseBackupDir, folderName)
+
+				if err := os.MkdirAll(backupDirPath, 0755); err != nil {
+					slog.Error("Failed to create automated backup directory", "error", err)
+					continue
 				}
 
-				// Limpieza de backups viejos
+				var backupErr error
+
+				// 2. Iterar sobre todos los shards y hacer un Hot Backup de cada uno
+				for i := 0; i < store.TotalShards; i++ {
+					shardFileName := fmt.Sprintf("shard_%d.db", i)
+					shardFilePath := filepath.Join(backupDirPath, shardFileName)
+
+					file, err := os.Create(shardFilePath)
+					if err != nil {
+						backupErr = fmt.Errorf("failed to create backup file for shard %d: %w", i, err)
+						break
+					}
+
+					err = store.GlobalDBs[i].View(func(tx *bbolt.Tx) error {
+						_, writeErr := tx.WriteTo(file)
+						return writeErr
+					})
+
+					file.Close()
+
+					if err != nil {
+						backupErr = fmt.Errorf("failed to write backup for shard %d: %w", i, err)
+						break
+					}
+				}
+
+				if backupErr != nil {
+					slog.Error("Automated backup failed", "error", backupErr)
+					os.RemoveAll(backupDirPath) // Limpiar la carpeta corrupta/incompleta si algo falla
+				} else {
+					slog.Info("Automated sharded backup completed successfully", "folder", folderName)
+				}
+
+				// 3. Limpieza de backups viejos (ahora son carpetas, usamos RemoveAll)
 				cutoffTime := time.Now().Add(-cfg.BackupRetention)
-				if entries, err := os.ReadDir(backupDir); err == nil {
+				if entries, err := os.ReadDir(baseBackupDir); err == nil {
 					for _, entry := range entries {
 						if info, err := entry.Info(); err == nil && info.ModTime().Before(cutoffTime) {
-							os.Remove(filepath.Join(backupDir, entry.Name()))
-							slog.Info("Old backup deleted", "file", entry.Name())
+							dirToRemove := filepath.Join(baseBackupDir, entry.Name())
+							os.RemoveAll(dirToRemove) // IMPORTANTE: RemoveAll borra la carpeta y su contenido
+							slog.Info("Old backup deleted", "folder", entry.Name())
 						}
 					}
 				}
