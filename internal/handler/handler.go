@@ -18,7 +18,6 @@ type ActivityUpdater interface {
 
 // ConnectionHandler manages a single client connection, including state like authentication and transactions.
 type ConnectionHandler struct {
-	MainStore            store.DataStore
 	CollectionManager    *store.CollectionManager
 	ActivityUpdater      ActivityUpdater
 	IsAuthenticated      bool
@@ -40,7 +39,6 @@ var connectionHandlerPool = sync.Pool{
 
 // Reset clears the handler's state for reuse from the pool.
 func (h *ConnectionHandler) Reset() {
-	h.MainStore = nil
 	h.CollectionManager = nil
 	h.ActivityUpdater = nil
 	h.IsAuthenticated = false
@@ -54,7 +52,6 @@ func (h *ConnectionHandler) Reset() {
 
 // GetConnectionHandlerFromPool retrieves a handler from the pool and initializes it.
 func GetConnectionHandlerFromPool(
-	mainStore store.DataStore,
 	colManager *store.CollectionManager,
 	txManager *store.TransactionManager,
 	updater ActivityUpdater,
@@ -71,7 +68,6 @@ func GetConnectionHandlerFromPool(
 		}
 	}
 
-	h.MainStore = mainStore
 	h.CollectionManager = colManager
 	h.TransactionManager = txManager
 	h.ActivityUpdater = updater
@@ -139,10 +135,6 @@ func (h *ConnectionHandler) HandleConnection(conn net.Conn) {
 			h.HandleCommit(reader, conn)
 		case protocol.CmdRollback:
 			h.handleRollback(reader, conn)
-		case protocol.CmdSet:
-			h.HandleMainStoreSet(reader, conn)
-		case protocol.CmdGet:
-			h.handleMainStoreGet(reader, conn)
 		case protocol.CmdCollectionCreate:
 			h.HandleCollectionCreate(reader, conn)
 		case protocol.CmdCollectionDelete:

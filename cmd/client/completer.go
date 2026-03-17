@@ -33,8 +33,6 @@ func (c *cli) getCompleter() readline.AutoCompleter {
 		readline.PcItem("update", readline.PcItem("password")),
 		readline.PcItem("backup"),
 		readline.PcItem("restore"),
-		readline.PcItem("set"),
-		readline.PcItem("get"),
 		readline.PcItem("collection",
 			readline.PcItem("create"),
 			readline.PcItem("delete", readline.PcItemDynamic(c.fetchCollectionNames)),

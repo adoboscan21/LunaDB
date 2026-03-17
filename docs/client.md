@@ -36,16 +36,6 @@ Authentication is required to execute most commands. User and permission managem
 
 ---
 
-## 👑 Main Store Commands (Root Only)
-
-These commands operate on the primary key-value store bypassing standard document collections. Available **only to the `root` user**.
-
-- 💾 **`set <key> <value_json>`**: Sets a raw key-value pair directly to disk.
-
-- 📥 **`get <key>`**: Retrieves the value associated with a key from the main store.
-
----
-
 ## 🛡️ Admin & Maintenance (Root Only)
 
 Low-level administrative operations.
@@ -60,7 +50,7 @@ Low-level administrative operations.
 
 LunaDB supports strict ACID transactions. Group multiple write operations and execute them atomically against the disk.
 
-- **`begin`**: Starts a new transaction block. The prompt will change to `[TX]`. *(Note: Read commands like `get` or `query` are temporarily disabled in this mode).*
+- **`begin`**: Starts a new transaction block. The prompt will change to `[TX]`. *(Note: Read collection commands like `get` or `query` are temporarily disabled in this mode).*
 
 - **`commit`**: Atomically flushes all queued operations to the physical disk in a single write. Validates existence constraints (e.g., preventing updates on non-existent keys) before applying.
 

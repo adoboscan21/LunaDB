@@ -36,8 +36,6 @@ func (c *cli) getCommands() map[string]command {
 		// Server Operations (Root only)
 		"backup":  {help: "backup - Triggers a manual server backup (root only)", handler: (*cli).handleBackup, category: "Server Operations"},
 		"restore": {help: "restore <backup_name> - Restores from a backup (root only)", handler: (*cli).handleRestore, category: "Server Operations"},
-		"set":     {help: "set <key> <value_json> - Set a key in the main store (root only)", handler: (*cli).handleMainSet, category: "Server Operations"},
-		"get":     {help: "get <key> - Get a key from the main store (root only)", handler: (*cli).handleMainGet, category: "Server Operations"},
 
 		// Collection Management
 		"collection create": {help: "collection create <name> - Creates a new collection", handler: (*cli).handleCollectionCreate, category: "Collection Management"},
@@ -335,39 +333,6 @@ func (c *cli) handleRestore(args string) error {
 	protocol.WriteRestoreCommand(&cmdBuf, parts[0])
 	c.conn.Write(cmdBuf.Bytes())
 	return c.readResponse("restore")
-}
-
-// handleMainSet handles the "set" command for the main store.
-func (c *cli) handleMainSet(args string) error {
-	parts := strings.SplitN(args, " ", 2)
-	if len(parts) < 2 {
-		return errors.New("usage: set <key> <value_json>")
-	}
-	key := parts[0]
-	jsonArg := parts[1]
-
-	// Conversión del input JSON crudo a BSON antes de enviarlo
-	bsonPayload, err := c.getJSONPayload(jsonArg)
-	if err != nil {
-		return fmt.Errorf("failed to parse JSON payload: %w", err)
-	}
-
-	var cmdBuf bytes.Buffer
-	protocol.WriteSetCommand(&cmdBuf, key, bsonPayload)
-	c.conn.Write(cmdBuf.Bytes())
-	return c.readResponse("set")
-}
-
-// handleMainGet handles the "get" command for the main store.
-func (c *cli) handleMainGet(args string) error {
-	parts := strings.Fields(args)
-	if len(parts) != 1 {
-		return errors.New("usage: get <key>")
-	}
-	var cmdBuf bytes.Buffer
-	protocol.WriteGetCommand(&cmdBuf, parts[0])
-	c.conn.Write(cmdBuf.Bytes())
-	return c.readResponse("get")
 }
 
 // handleCollectionCreate handles the "collection create" command.

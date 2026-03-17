@@ -11,17 +11,14 @@ import (
 type CommandType byte
 
 const (
-	// Main Store Commands
-	CmdSet CommandType = iota + 1 // SET key, value
-	CmdGet                        // GET key
 
 	// Collection Management Commands
-	CmdCollectionCreate      // CREATE_COLLECTION collectionName
-	CmdCollectionDelete      // DELETE_COLLECTION collectionName
-	CmdCollectionList        // LIST_COLLECTIONS
-	CmdCollectionIndexCreate // CREATE_COLLECTION_INDEX collectionName, fieldName
-	CmdCollectionIndexDelete // DELETE_COLLECTION_INDEX collectionName, fieldName
-	CmdCollectionIndexList   // LIST_COLLECTION_INDEXES collectionName
+	CmdCollectionCreate      CommandType = iota + 1 // CREATE_COLLECTION collectionName
+	CmdCollectionDelete                             // DELETE_COLLECTION collectionName
+	CmdCollectionList                               // LIST_COLLECTIONS
+	CmdCollectionIndexCreate                        // CREATE_COLLECTION_INDEX collectionName, fieldName
+	CmdCollectionIndexDelete                        // DELETE_COLLECTION_INDEX collectionName, fieldName
+	CmdCollectionIndexList                          // LIST_COLLECTION_INDEXES collectionName
 
 	// Collection Item Commands
 	CmdCollectionItemSet        // SET_COLLECTION_ITEM collectionName, key, value
@@ -287,55 +284,6 @@ func WriteBytes(w io.Writer, b []byte) error {
 		return fmt.Errorf("failed to write bytes: %w", err)
 	}
 	return nil
-}
-
-// WriteSetCommand writes a SET command to the connection.
-// Format: [CmdSet (1 byte)] [KeyLength (4 bytes)] [Key] [ValueLength (4 bytes)] [Value]
-func WriteSetCommand(w io.Writer, key string, value []byte) error {
-	if _, err := w.Write([]byte{byte(CmdSet)}); err != nil {
-		return fmt.Errorf("failed to write command type: %w", err)
-	}
-	if err := WriteString(w, key); err != nil {
-		return fmt.Errorf("failed to write key: %w", err)
-	}
-	if err := WriteBytes(w, value); err != nil {
-		return fmt.Errorf("failed to write value: %w", err)
-	}
-	return nil
-}
-
-// ReadSetCommand reads a SET command from the connection.
-func ReadSetCommand(r io.Reader) (key string, value []byte, err error) {
-	key, err = ReadString(r)
-	if err != nil {
-		return "", nil, fmt.Errorf("failed to read key: %w", err)
-	}
-	value, err = ReadBytes(r)
-	if err != nil {
-		return "", nil, fmt.Errorf("failed to read value: %w", err)
-	}
-	return key, value, nil
-}
-
-// WriteGetCommand writes a GET command to the connection.
-// Format: [CmdGet (1 byte)] [KeyLength (4 bytes)] [Key]
-func WriteGetCommand(w io.Writer, key string) error {
-	if _, err := w.Write([]byte{byte(CmdGet)}); err != nil {
-		return fmt.Errorf("failed to write command type: %w", err)
-	}
-	if err := WriteString(w, key); err != nil {
-		return fmt.Errorf("failed to write key: %w", err)
-	}
-	return nil
-}
-
-// ReadGetCommand reads a GET command from the connection.
-func ReadGetCommand(r io.Reader) (key string, err error) {
-	key, err = ReadString(r)
-	if err != nil {
-		return "", fmt.Errorf("failed to read key: %w", err)
-	}
-	return key, nil
 }
 
 // WriteCollectionCreateCommand writes a CREATE_COLLECTION command to the connection.
@@ -804,8 +752,6 @@ func ReadCommandPayload(r io.Reader, cmdType CommandType) ([]byte, error) {
 		numStr, numBytes int
 		hasKeys          bool
 	}{
-		CmdSet:                      {1, 1, false},
-		CmdGet:                      {1, 0, false},
 		CmdCollectionCreate:         {1, 0, false},
 		CmdCollectionDelete:         {1, 0, false},
 		CmdCollectionList:           {0, 0, false},

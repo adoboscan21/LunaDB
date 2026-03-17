@@ -81,9 +81,6 @@ func main() {
 	// Inicializamos nuestros administradores
 	collectionManager := store.NewCollectionManager()
 
-	// La base de datos principal (comandos SET/GET crudos) será simplemente un Bucket especial
-	mainStore := collectionManager.GetCollection("_main_store")
-
 	// Reconstruir B-Trees en RAM leyendo los Buckets del disco
 	if err := collectionManager.InitializeFromDisk(); err != nil {
 		slog.Error("Fatal error initializing collections from disk", "error", err)
@@ -144,7 +141,6 @@ func main() {
 		go func(id int) {
 			for conn := range jobs {
 				h := handler.GetConnectionHandlerFromPool(
-					mainStore,
 					collectionManager,
 					transactionManager,
 					updateActivityFunc(func() { lastActivity.Store(time.Now()) }),
