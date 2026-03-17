@@ -140,8 +140,6 @@ func (h *ConnectionHandler) processCollectionQuery(collectionName string, query 
 	isPureAggregation := len(query.Filter) == 0 && len(query.Lookups) == 0 && len(query.Projection) == 0 && len(query.Aggregations) > 0 && query.Distinct == ""
 
 	if isPureAggregation {
-		// En lugar de cargar 100,000 documentos en un array en la RAM para luego iterarlos,
-		// delegamos la tarea a un lector continuo que suma "al vuelo".
 		return h.streamAggregations(colStore, query)
 	}
 
@@ -169,7 +167,6 @@ func (h *ConnectionHandler) processCollectionQuery(collectionName string, query 
 				processedCount++
 				return true
 			}
-			// En DiskStore, 'value' es una copia segura, podemos referenciarla en bson.Raw
 			rawResults = append(rawResults, bson.Raw(value))
 			if limit != -1 && len(rawResults) >= limit {
 				return false
@@ -182,7 +179,6 @@ func (h *ConnectionHandler) processCollectionQuery(collectionName string, query 
 	var paginatedRaw []bson.Raw
 	usedFastPath := false
 
-	// Evaluamos si el límite nos permite hacer cortocircuito temprano
 	canShortCircuit := query.Limit != nil && len(query.OrderBy) == 0 && len(query.Aggregations) == 0 && len(query.GroupBy) == 0
 	var limitTarget int
 	if canShortCircuit {
@@ -201,9 +197,15 @@ func (h *ConnectionHandler) processCollectionQuery(collectionName string, query 
 			}
 			offset := query.Offset
 			matchCount := 0
+			seenKeys := make(map[string]struct{})
 
 			if len(query.Filter) == 0 {
 				colStore.StreamByIndex(orderField, isDesc, func(key string) bool {
+					if _, seen := seenKeys[key]; seen {
+						return true
+					}
+					seenKeys[key] = struct{}{}
+
 					matchCount++
 					if matchCount > offset {
 						if vBytes, found := colStore.Get(key); found {
@@ -224,6 +226,11 @@ func (h *ConnectionHandler) processCollectionQuery(collectionName string, query 
 			} else {
 				compiledEvaluator := h.compileFilter(query.Filter)
 				colStore.StreamByIndex(orderField, isDesc, func(key string) bool {
+					if _, seen := seenKeys[key]; seen {
+						return true
+					}
+					seenKeys[key] = struct{}{}
+
 					if vBytes, found := colStore.Get(key); found {
 						rawDoc := bson.Raw(vBytes)
 						if compiledEvaluator(rawDoc) {
@@ -267,6 +274,16 @@ func (h *ConnectionHandler) processCollectionQuery(collectionName string, query 
 		compiledEvaluator := h.compileFilter(remainingFilter)
 
 		if usedIndex {
+			uniqueKeys := make(map[string]struct{}, len(candidateKeys))
+			dedupedKeys := make([]string, 0, len(candidateKeys))
+			for _, k := range candidateKeys {
+				if _, exists := uniqueKeys[k]; !exists {
+					uniqueKeys[k] = struct{}{}
+					dedupedKeys = append(dedupedKeys, k)
+				}
+			}
+			candidateKeys = dedupedKeys
+
 			numKeys := len(candidateKeys)
 
 			if numKeys > 1000 && !canShortCircuit {
