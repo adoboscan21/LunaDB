@@ -33,4 +33,6 @@ type DataStore interface {
 	UpdateMany(patches map[string][]byte) (int, []string)
 	GetDistinctValues(field string) ([]any, bool)
 	GetGroupedCount(field string) (map[any]int, bool)
+	IndexCount(field string, value any) int
+	IndexRangeCount(field string, low, high any, lowInclusive, highInclusive bool) int
 }

@@ -168,10 +168,13 @@ func (wb *WriteBatcher) Start() {
 	}()
 }
 
-// commitBatch ejecuta una sola transacción en disco para múltiples operaciones en memoria.
+// commitBatch ejecuta una sola transacción en disco para múltiples operaciones.
+// OPTIMIZACIÓN: Agrupa todas las escrituras por Bucket para maximizar la localidad de caché del SO.
 func (wb *WriteBatcher) commitBatch(batch []*BatchOp) {
-	// UNA SOLA transacción ACID física en el disco duro (específico de este Shard) para cientos de peticiones
 	err := wb.db.Update(func(tx *bbolt.Tx) error {
+		// Agrupador masivo de escrituras validadas
+		groupedWrites := make(map[string][]TxWrite)
+
 		for _, op := range batch {
 			if op.IsTx {
 				// 1. VALIDACIÓN ULTRA RÁPIDA (Dentro del cerrojo de bbolt)
@@ -184,7 +187,6 @@ func (wb *WriteBatcher) commitBatch(batch []*BatchOp) {
 					}
 
 					exists := b.Get(write.Key) != nil
-
 					if write.MustNotExist && exists {
 						txErr = fmt.Errorf("transaction aborted: key conflict on '%s'", write.Key)
 						break
@@ -195,40 +197,49 @@ func (wb *WriteBatcher) commitBatch(batch []*BatchOp) {
 					}
 				}
 
-				// Si una validación falla, fallamos ESTA transacción, pero salvamos el resto del Batch
 				if txErr != nil {
 					op.Done <- txErr
 					continue
 				}
 
-				// 2. MUTACIÓN (Garantizada y atómica)
+				// 2. Si es válida, agrupamos sus escrituras lógicamente
 				for _, write := range op.TxWrites {
-					b := tx.Bucket(write.Collection)
-					if write.IsDelete {
-						b.Delete(write.Key)
-					} else {
-						b.Put(write.Key, write.Value)
-					}
+					colStr := string(write.Collection)
+					groupedWrites[colStr] = append(groupedWrites[colStr], write)
 				}
-				op.Done <- nil // Transacción Exitosa
+				op.Done <- nil // Transacción validada y encolada
 
 			} else {
-				// Lógica de Operación Simple (Single Write)
-				b, err := tx.CreateBucketIfNotExists(op.Collection)
-				if err == nil && b != nil {
-					if op.IsDelete {
-						b.Delete(op.Key)
-					} else {
-						b.Put(op.Key, op.Value)
-					}
+				// Lógica de Operación Simple
+				_, err := tx.CreateBucketIfNotExists(op.Collection)
+				if err != nil {
+					op.Done <- err
+					continue
 				}
-				op.Done <- err
+				colStr := string(op.Collection)
+				groupedWrites[colStr] = append(groupedWrites[colStr], TxWrite{
+					Collection: op.Collection, Key: op.Key, Value: op.Value, IsDelete: op.IsDelete,
+				})
+				op.Done <- nil
+			}
+		}
+
+		// 3. MUTACIÓN EN DISCO AGRUPADA POR BUCKET (El secreto de la velocidad)
+		// Al hacer esto, bbolt carga la página de disco del índice una sola vez,
+		// inserta miles de llaves y luego pasa al siguiente índice.
+		for bucketName, writes := range groupedWrites {
+			b := tx.Bucket([]byte(bucketName))
+			for _, write := range writes {
+				if write.IsDelete {
+					b.Delete(write.Key)
+				} else {
+					b.Put(write.Key, write.Value)
+				}
 			}
 		}
 		return nil
 	})
 
-	// Si todo el bbolt Update falló por un error catastrófico de disco (muy raro), avisamos a todos
 	if err != nil {
 		for _, op := range batch {
 			select {

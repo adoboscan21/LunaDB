@@ -135,7 +135,7 @@ func (tm *TransactionManager) RecordWrite(txID string, op WriteOperation) error 
 	return nil
 }
 
-// Commit procesa la transacción enrutando las operaciones a sus respectivas particiones (Shards).
+// Commit procesa la transacción enrutando las operaciones y sus índices a sus particiones.
 func (tm *TransactionManager) Commit(txID string) error {
 	tm.mu.RLock()
 	tx, exists := tm.transactions[txID]
@@ -165,15 +165,7 @@ func (tm *TransactionManager) Commit(txID string) error {
 	// Estructura para almacenar lo que mandaremos a cada Batcher
 	txWritesByShard := make(map[int][]TxWrite)
 
-	// Estructura temporal para recordar qué actualizar en los índices RAM después
-	type meta struct {
-		op            WriteOperation
-		oldValue      []byte
-		enrichedValue []byte
-	}
-	metaList := make([]meta, 0, len(writeSetToProcess))
-
-	// --- FASE 1: PRE-PROCESAMIENTO OPTIMISTA (Por cada Shard involucrado) ---
+	// --- FASE 1: PRE-PROCESAMIENTO OPTIMISTA Y ENSAMBLAJE DE ÍNDICES ---
 	for shardID, ops := range opsByShard {
 		db := GlobalDBs[shardID]
 		var localTxWrites []TxWrite
@@ -199,10 +191,8 @@ func (tm *TransactionManager) Commit(txID string) error {
 					return fmt.Errorf("commit failed: key '%s' does not exist in '%s'", op.Key, op.Collection)
 				}
 
-				m := meta{op: op, oldValue: oldVal}
-
-				// Parseo y ensamblaje de BSON en RAM
 				if op.OpType != OpTypeDelete {
+					// Parseo y ensamblaje de BSON en RAM
 					var data bson.M
 					bson.Unmarshal(op.Value, &data)
 					data[globalconst.UPDATED_AT] = now
@@ -211,12 +201,12 @@ func (tm *TransactionManager) Commit(txID string) error {
 					}
 
 					enrichedValue, _ := bson.Marshal(data)
-					m.enrichedValue = enrichedValue
 
 					// Estructura persistente final
 					rec := ItemRecord{Value: enrichedValue, CreatedAt: now}
 					recBytes, _ := bson.Marshal(rec)
 
+					// Escribir documento principal
 					localTxWrites = append(localTxWrites, TxWrite{
 						Collection:   []byte(op.Collection),
 						Key:          []byte(op.Key),
@@ -225,15 +215,68 @@ func (tm *TransactionManager) Commit(txID string) error {
 						MustExist:    op.OpType == OpTypeUpdate,
 						MustNotExist: op.OpType == OpTypeSet,
 					})
+
+					// === GESTIÓN DE ÍNDICES ===
+					colStore := tm.cm.GetCollection(op.Collection)
+					if ds, ok := colStore.(*DiskStore); ok {
+						indexedFields := ds.indexes.ListIndexes()
+
+						// Si es un UPDATE, preparamos la eliminación de los índices viejos
+						if oldVal != nil {
+							oldData := extractIndexedValues(oldVal, indexedFields)
+							for field, val := range oldData {
+								if oldK := encodeIndexKey(val, op.Key); oldK != nil {
+									idxBucket := []byte("_idx_" + op.Collection + "_" + field)
+									localTxWrites = append(localTxWrites, TxWrite{
+										Collection: idxBucket,
+										Key:        oldK,
+										IsDelete:   true,
+									})
+								}
+							}
+						}
+
+						// Escribimos los índices nuevos (insert y update)
+						newData := extractIndexedValues(enrichedValue, indexedFields)
+						for field, val := range newData {
+							if newK := encodeIndexKey(val, op.Key); newK != nil {
+								idxBucket := []byte("_idx_" + op.Collection + "_" + field)
+								localTxWrites = append(localTxWrites, TxWrite{
+									Collection: idxBucket,
+									Key:        newK,
+									Value:      []byte{},
+									IsDelete:   false,
+								})
+							}
+						}
+					}
+
 				} else {
+					// OpTypeDelete
 					localTxWrites = append(localTxWrites, TxWrite{
 						Collection: []byte(op.Collection),
 						Key:        []byte(op.Key),
 						IsDelete:   true,
 						MustExist:  true,
 					})
+
+					// === BORRADO DE ÍNDICES ===
+					colStore := tm.cm.GetCollection(op.Collection)
+					if ds, ok := colStore.(*DiskStore); ok && oldVal != nil {
+						indexedFields := ds.indexes.ListIndexes()
+						oldData := extractIndexedValues(oldVal, indexedFields)
+						for field, val := range oldData {
+							if oldK := encodeIndexKey(val, op.Key); oldK != nil {
+								idxBucket := []byte("_idx_" + op.Collection + "_" + field)
+								localTxWrites = append(localTxWrites, TxWrite{
+									Collection: idxBucket,
+									Key:        oldK,
+									IsDelete:   true,
+								})
+							}
+						}
+					}
 				}
-				metaList = append(metaList, m)
 			}
 			return nil
 		})
@@ -247,45 +290,34 @@ func (tm *TransactionManager) Commit(txID string) error {
 	}
 
 	// --- FASE 2: DELEGACIÓN PARALELA A LOS WRITE BATCHERS ---
+	// Declaramos el tipo ANTES de usarlo en el make()
+	type channelResult struct {
+		shardID int
+		err     error
+	}
+
 	// Mandamos las operaciones a cada Shard simultáneamente
-	errCh := make(chan error, len(txWritesByShard))
+	errCh := make(chan channelResult, len(txWritesByShard))
+
 	for shardID, txWrites := range txWritesByShard {
 		go func(sID int, writes []TxWrite) {
-			errCh <- GlobalBatchers[sID].SubmitTx(writes)
+			errCh <- channelResult{shardID: sID, err: GlobalBatchers[sID].SubmitTx(writes)}
 		}(shardID, txWrites)
 	}
 
-	// Esperamos a que todos los shards confirmen la escritura
+	// Esperamos a que todos los shards confirmen la escritura atómica en el disco duro
 	var commitErr error
 	for i := 0; i < len(txWritesByShard); i++ {
-		if err := <-errCh; err != nil && commitErr == nil {
-			commitErr = err
+		res := <-errCh
+		if res.err != nil && commitErr == nil {
+			commitErr = res.err
 		}
 	}
 
 	if commitErr != nil {
-		// Si un batcher falla, reportamos el error.
-		// (Nota: Sin un log WAL distribuido, podría haber un commit parcial si un shard triunfó y otro falló por disco dañado).
+		// En un sistema altamente distribuido, un fallo aquí requeriría recuperación por WAL.
 		tm.Rollback(txID)
 		return commitErr
-	}
-
-	// --- FASE 3: ACTUALIZAR ÍNDICES EN RAM POST-COMMIT ---
-	for _, m := range metaList {
-		col := tm.cm.GetCollection(m.op.Collection)
-		if ds, ok := col.(*DiskStore); ok {
-			indexedFields := ds.indexes.ListIndexes()
-			var oldDataForIndex, newDataForIndex map[string]any
-
-			if m.oldValue != nil {
-				oldDataForIndex = extractIndexedValues(m.oldValue, indexedFields)
-			}
-			if m.op.OpType != OpTypeDelete {
-				newDataForIndex = extractIndexedValues(m.enrichedValue, indexedFields)
-			}
-
-			ds.indexes.Update(m.op.Key, oldDataForIndex, newDataForIndex)
-		}
 	}
 
 	// Limpieza de la memoria del TransactionManager
@@ -293,11 +325,11 @@ func (tm *TransactionManager) Commit(txID string) error {
 	delete(tm.transactions, txID)
 	tm.mu.Unlock()
 
-	slog.Info("Transaction successfully committed to sharded disk via Parallel Group Commit", "txID", txID, "ops_count", len(metaList), "shards_touched", len(txWritesByShard))
+	slog.Info("Transaction committed with indexes to sharded disk via Parallel Group Commit", "txID", txID, "shards_touched", len(txWritesByShard))
 	return nil
 }
 
-// Rollback cancela y limpia la transacción.
+// Rollback cancela y limpia la transacción de la memoria.
 func (tm *TransactionManager) Rollback(txID string) error {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()

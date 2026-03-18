@@ -1,11 +1,12 @@
 package store
 
 import (
+	"bytes"
 	"log/slog"
+	"strings"
 	"sync"
 
 	"go.etcd.io/bbolt"
-	"go.mongodb.org/mongo-driver/bson"
 
 	"lunadb/internal/globalconst"
 )
@@ -24,7 +25,6 @@ func NewCollectionManager() *CollectionManager {
 }
 
 // GetCollection obtiene una colección existente (DiskStore) por nombre, o la crea si no existe.
-// Nota: NewDiskStore ya se encarga de crear el Bucket en todos los shards físicos.
 func (cm *CollectionManager) GetCollection(name string) DataStore {
 	cm.mu.RLock()
 	col, found := cm.collections[name]
@@ -42,34 +42,46 @@ func (cm *CollectionManager) GetCollection(name string) DataStore {
 	}
 
 	newCol := NewDiskStore(name)
-	newCol.CreateIndex(globalconst.ID) // Creamos el índice principal en RAM
+	newCol.CreateIndex(globalconst.ID) // Registramos el índice principal en la metadata RAM
 
 	cm.collections[name] = newCol
 	slog.Info("Collection opened/created in sharded disk engine", "name", name)
 	return newCol
 }
 
-// DeleteCollection elimina una colección permanentemente de TODOS los shards y de la memoria.
+// DeleteCollection elimina una colección permanentemente de TODOS los shards, incluyendo sus índices.
 func (cm *CollectionManager) DeleteCollection(name string) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	// Eliminamos el Bucket físico en todas las particiones
+	// Eliminamos el Bucket principal y sus Buckets de índices en todas las particiones
 	for i := 0; i < TotalShards; i++ {
 		err := GlobalDBs[i].Update(func(tx *bbolt.Tx) error {
-			return tx.DeleteBucket([]byte(name))
+			// Borramos la data principal
+			tx.DeleteBucket([]byte(name))
+
+			// Buscamos y borramos todos los Buckets de índices asociados a esta colección
+			var bucketsToDelete [][]byte
+			prefix := []byte("_idx_" + name + "_")
+
+			tx.ForEach(func(bName []byte, _ *bbolt.Bucket) error {
+				if bytes.HasPrefix(bName, prefix) {
+					bucketsToDelete = append(bucketsToDelete, bName)
+				}
+				return nil
+			})
+
+			for _, bName := range bucketsToDelete {
+				tx.DeleteBucket(bName)
+			}
+			return nil
 		})
 
-		if err != nil {
-			if err == bbolt.ErrBucketNotFound {
-				// No es grave si en un shard específico no estaba el bucket, pero lo advertimos
-				slog.Debug("Bucket not found during deletion on a specific shard", "name", name, "shard_id", i)
-			} else {
-				slog.Error("Failed to delete collection from shard", "name", name, "shard_id", i, "error", err)
-			}
+		if err != nil && err != bbolt.ErrBucketNotFound {
+			slog.Error("Failed to delete collection from shard", "name", name, "shard_id", i, "error", err)
 		}
 	}
-	slog.Info("Collection deleted from all physical shards", "name", name)
+	slog.Info("Collection and its indexes deleted from all physical shards", "name", name)
 
 	// Eliminamos de la memoria RAM
 	if _, exists := cm.collections[name]; exists {
@@ -78,14 +90,18 @@ func (cm *CollectionManager) DeleteCollection(name string) {
 	}
 }
 
-// ListCollections hace una recolección (Scatter-Gather) para leer los nombres de todos los Buckets en todos los shards.
+// ListCollections lee los nombres de todos los Buckets, filtrando los de índices internos.
 func (cm *CollectionManager) ListCollections() []string {
 	uniqueNames := make(map[string]struct{})
 
 	for i := 0; i < TotalShards; i++ {
 		GlobalDBs[i].View(func(tx *bbolt.Tx) error {
 			return tx.ForEach(func(name []byte, _ *bbolt.Bucket) error {
-				uniqueNames[string(name)] = struct{}{}
+				nameStr := string(name)
+				// Excluimos los buckets internos de índices para que no salgan en la lista de colecciones
+				if !strings.HasPrefix(nameStr, "_idx_") {
+					uniqueNames[nameStr] = struct{}{}
+				}
 				return nil
 			})
 		})
@@ -118,47 +134,47 @@ func (cm *CollectionManager) CollectionExists(name string) bool {
 	return exists
 }
 
-// InitializeFromDisk es una función CRÍTICA para el arranque del servidor.
-// Reconstruye los índices en memoria RAM leyendo los datos distribuidos en todos los shards.
+// InitializeFromDisk es ultra rápido. Solo escanea la estructura del disco para reconstruir los metadatos.
 func (cm *CollectionManager) InitializeFromDisk() error {
-	collectionNames := cm.ListCollections()
-	slog.Info("Initializing collections from sharded disk...", "count", len(collectionNames), "total_shards", TotalShards)
+	slog.Info("Scanning disk to initialize index metadata...")
 
-	for _, colName := range collectionNames {
-		colStore := cm.GetCollection(colName)
-		slog.Info("Rebuilding in-memory indexes for collection", "collection", colName)
+	// Recolectamos la información primero para evitar deadlocks de bbolt (View vs Update)
+	foundIndexes := make(map[string][]string)
 
-		// Debemos leer de cada fragmento (shard) para tener el índice completo en memoria
-		for i := 0; i < TotalShards; i++ {
-			GlobalDBs[i].View(func(tx *bbolt.Tx) error {
-				b := tx.Bucket([]byte(colName))
-				if b == nil {
-					return nil
-				}
-
-				c := b.Cursor()
-				for k, v := c.First(); k != nil; k, v = c.Next() {
-					var record ItemRecord
-					if err := bson.Unmarshal(v, &record); err == nil {
-						indexedFields := colStore.ListIndexes()
-						dataForIndex := extractIndexedValues(record.Value, indexedFields)
-
-						if dataForIndex != nil {
-							if ds, ok := colStore.(*DiskStore); ok {
-								ds.indexes.Update(string(k), nil, dataForIndex)
-							}
-						}
+	for i := 0; i < TotalShards; i++ {
+		GlobalDBs[i].View(func(tx *bbolt.Tx) error {
+			return tx.ForEach(func(name []byte, _ *bbolt.Bucket) error {
+				nameStr := string(name)
+				// Si detectamos un bucket de índice, registramos su metadata
+				if strings.HasPrefix(nameStr, "_idx_") {
+					// El formato es: _idx_NombreColeccion_NombreCampo
+					parts := strings.SplitN(nameStr, "_", 4)
+					if len(parts) >= 4 {
+						colName := parts[2]
+						fieldName := parts[3]
+						foundIndexes[colName] = append(foundIndexes[colName], fieldName)
 					}
 				}
 				return nil
 			})
+		})
+	}
+
+	// Aplicamos la metadata a los objetos en RAM de forma segura
+	for colName, fields := range foundIndexes {
+		col := cm.GetCollection(colName)
+		if ds, ok := col.(*DiskStore); ok {
+			for _, fieldName := range fields {
+				ds.indexes.CreateIndex(fieldName)
+			}
 		}
 	}
-	slog.Info("Finished initializing all collections and rebuilding indexes.")
+
+	slog.Info("Index metadata initialized successfully. Zero RAM overhead.")
 	return nil
 }
 
-// Funciones de control de colas (ahora no-ops para la persistencia directa y segura)
+// Funciones de control de colas en desuso temporal (ahora manejadas por Group Commit Worker)
 func (cm *CollectionManager) Wait()                                                {}
 func (cm *CollectionManager) EnqueueSaveTask(collectionName string, col DataStore) {}
 func (cm *CollectionManager) EnqueueDeleteTask(collectionName string)              {}

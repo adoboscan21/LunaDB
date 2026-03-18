@@ -162,12 +162,18 @@ func (h *ConnectionHandler) processCollectionQuery(collectionName string, query 
 			limit = *query.Limit
 		}
 
+		var mu sync.Mutex
 		colStore.StreamAll(func(key string, value []byte) bool {
+			mu.Lock()
+			defer mu.Unlock()
 			if processedCount < query.Offset {
 				processedCount++
 				return true
 			}
-			rawResults = append(rawResults, bson.Raw(value))
+			// Copia segura de los bytes mmapeados de bbolt
+			safeCopy := make([]byte, len(value))
+			copy(safeCopy, value)
+			rawResults = append(rawResults, bson.Raw(safeCopy))
 			if limit != -1 && len(rawResults) >= limit {
 				return false
 			}
@@ -353,14 +359,20 @@ func (h *ConnectionHandler) processCollectionQuery(collectionName string, query 
 			}
 			finalRawResults = make([]bson.Raw, 0, capacity)
 
+			var mu sync.Mutex
 			colStore.StreamAll(func(k string, vBytes []byte) bool {
 				rawDoc := bson.Raw(vBytes)
 				if compiledEvaluator(rawDoc) {
-					finalRawResults = append(finalRawResults, rawDoc)
+					mu.Lock()
+					safeCopy := make([]byte, len(vBytes))
+					copy(safeCopy, vBytes)
+					finalRawResults = append(finalRawResults, bson.Raw(safeCopy))
 
 					if canShortCircuit && len(finalRawResults) >= limitTarget {
+						mu.Unlock()
 						return false
 					}
+					mu.Unlock()
 				}
 				return true
 			})
@@ -680,62 +692,58 @@ func (h *ConnectionHandler) findCandidateKeysFromFilter(colStore store.DataStore
 		}
 
 		if len(andConditions) > 0 {
-			keySets := [][]string{}
-			nonIndexedConditions := bson.A{}
+			// === NUEVO QUERY PLANNER (COST-BASED OPTIMIZER) ===
+			bestIdx := -1
+			minCost := int(^uint(0) >> 1) // Max Int (Infinito)
 
-			for _, cond := range andConditions {
+			// 1. Fase de Estimación (Identificar el índice más restrictivo/pequeño)
+			for i, cond := range andConditions {
 				condMap, isMap := asMap(cond)
 				if !isMap {
-					nonIndexedConditions = append(nonIndexedConditions, cond)
 					continue
 				}
+				cost := h.estimateFilterCardinality(colStore, condMap)
+				if cost < minCost {
+					minCost = cost
+					bestIdx = i
+				}
+			}
 
-				subKeys, subIndexUsed, subRemainingFilter := h.findCandidateKeysFromFilter(colStore, condMap)
+			// 2. Fase de Ejecución (Solo ejecutamos el más rápido en disco)
+			if bestIdx != -1 && minCost != int(^uint(0)>>1) {
+				bestCond, _ := asMap(andConditions[bestIdx])
+
+				// Extraemos del disco SOLAMENTE las llaves de la condición más barata
+				subKeys, subIndexUsed, subRemainingFilter := h.findCandidateKeysFromFilter(colStore, bestCond)
 
 				if subIndexUsed {
-					keySets = append(keySets, subKeys)
+					slog.Debug("Query Planner: Selected best index", "cost", minCost, "total_conditions", len(andConditions))
+
+					// Empujamos el RESTO de las condiciones a la evaluación en RAM
+					nonIndexedConditions := bson.A{}
 					if len(subRemainingFilter) > 0 {
 						nonIndexedConditions = append(nonIndexedConditions, subRemainingFilter)
 					}
-				} else {
-					nonIndexedConditions = append(nonIndexedConditions, condMap)
-				}
-			}
 
-			if len(keySets) > 0 {
-				sort.Slice(keySets, func(i, j int) bool {
-					return len(keySets[i]) < len(keySets[j])
-				})
-
-				intersectionMap := make(map[string]struct{}, len(keySets[0]))
-				for _, key := range keySets[0] {
-					intersectionMap[key] = struct{}{}
-				}
-
-				for i := 1; i < len(keySets); i++ {
-					if len(intersectionMap) == 0 {
-						break
-					}
-					currentSetMap := make(map[string]struct{})
-					for _, key := range keySets[i] {
-						if _, found := intersectionMap[key]; found {
-							currentSetMap[key] = struct{}{}
+					for i, cond := range andConditions {
+						if i != bestIdx { // Ignoramos la que ya procesamos
+							nonIndexedConditions = append(nonIndexedConditions, cond)
 						}
 					}
-					intersectionMap = currentSetMap
-				}
 
-				finalKeys := make([]string, 0, len(intersectionMap))
-				for key := range intersectionMap {
-					finalKeys = append(finalKeys, key)
-				}
+					newFilter := make(map[string]any)
+					if len(nonIndexedConditions) > 0 {
+						newFilter[globalconst.OpAnd] = nonIndexedConditions
+					}
 
-				newFilter := make(map[string]any)
-				if len(nonIndexedConditions) > 0 {
-					newFilter[globalconst.OpAnd] = nonIndexedConditions
+					// Retornamos la poca cantidad de llaves, y el motor filtrará el resto en RAM
+					return subKeys, true, newFilter
 				}
-				return finalKeys, true, newFilter
 			}
+			// =================================================
+
+			// Fallback (Si no hay índices útiles, pasa todo a RAM)
+			return nil, false, filter
 		}
 	}
 
@@ -1750,12 +1758,16 @@ func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *
 	}
 
 	groups := make(map[string]*aggAccumulator)
-	keyBuffer := make([]byte, 0, 128)
+	var mu sync.Mutex // <--- Mutex para el mapa
 
-	// 🚀 Leemos directo del disco con Zero-Copy y procesamos al instante
+	// Pool de buffers para mantener 0 asignaciones de memoria bajo concurrencia extrema
+	var bufPool = sync.Pool{New: func() any { b := make([]byte, 0, 128); return &b }}
+
 	colStore.StreamAll(func(k string, vBytes []byte) bool {
 		item := bson.Raw(vBytes)
-		keyBuffer = keyBuffer[:0]
+
+		bp := bufPool.Get().(*[]byte)
+		keyBuffer := (*bp)[:0]
 
 		if len(query.GroupBy) == 0 {
 			keyBuffer = append(keyBuffer, "_no_group_"...)
@@ -1764,7 +1776,6 @@ func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *
 				if i > 0 {
 					keyBuffer = append(keyBuffer, '|')
 				}
-				// 🚀 Lectura O(1) directo de los bytes, sin crear un map[string]any
 				val, err := item.LookupErr(parsedGroupPaths[i]...)
 				if err == nil && val.Type != bsontype.Null {
 					keyBuffer = append(keyBuffer, byte(val.Type))
@@ -1775,10 +1786,11 @@ func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *
 			}
 		}
 
-		// 🔥 ZERO-ALLOCATION FAST PATH: string(keyBuffer) es la única allocation
 		groupStrKey := string(keyBuffer)
-		acc, exists := groups[groupStrKey]
+		bufPool.Put(bp) // Devolvemos el buffer limpio
 
+		mu.Lock()
+		acc, exists := groups[groupStrKey]
 		if !exists {
 			groupVals := make([]any, len(query.GroupBy))
 			if len(query.GroupBy) > 0 {
@@ -1788,7 +1800,6 @@ func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *
 					}
 				}
 			}
-
 			acc = &aggAccumulator{
 				GroupValues: groupVals,
 				Sums:        make([]float64, len(ops)),
@@ -1799,7 +1810,6 @@ func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *
 			}
 			groups[groupStrKey] = acc
 		}
-
 		acc.Count++
 
 		for i, op := range ops {
@@ -1810,7 +1820,6 @@ func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *
 				continue
 			}
 
-			// 🚀 Extracción cruda: saltamos la decodificación completa del documento
 			val, err := item.LookupErr(op.ParsedPath...)
 			if err != nil || val.Type == bsontype.Null {
 				continue
@@ -1821,7 +1830,6 @@ func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *
 				continue
 			}
 
-			// 🔥 MATEMÁTICA DIRECTA DESDE LOS BYTES
 			var num float64
 			isNum := true
 			switch val.Type {
@@ -1854,13 +1862,13 @@ func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *
 				}
 			}
 		}
+		mu.Unlock()
 		return true
 	})
 
 	var aggregatedResults []bson.M
 	for groupKey, acc := range groups {
 		resultRow := make(bson.M)
-
 		if len(query.GroupBy) > 0 && groupKey != "_no_group_" {
 			for i, field := range query.GroupBy {
 				setNestedValue(resultRow, field, acc.GroupValues[i])
@@ -1909,6 +1917,96 @@ func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *
 			aggregatedResults = append(aggregatedResults, resultRow)
 		}
 	}
-
 	return aggregatedResults, nil
+}
+
+// estimateFilterCardinality calcula el "costo" de una consulta preguntando al disco sin cargar datos.
+func (h *ConnectionHandler) estimateFilterCardinality(colStore store.DataStore, filter map[string]any) int {
+	maxInt := int(^uint(0) >> 1) // Representa Infinito (Full Table Scan)
+	if len(filter) == 0 {
+		return maxInt
+	}
+
+	if andRaw, exists := filter[globalconst.OpAnd]; exists {
+		var andConditions []any
+		if ba, ok := andRaw.(bson.A); ok {
+			andConditions = ba
+		} else if arr, ok := andRaw.([]any); ok {
+			andConditions = arr
+		}
+		minCard := maxInt
+		for _, cond := range andConditions {
+			if condMap, isM := asMap(cond); isM {
+				card := h.estimateFilterCardinality(colStore, condMap)
+				if card < minCard {
+					minCard = card
+				}
+			}
+		}
+		return minCard
+	}
+
+	if orRaw, exists := filter[globalconst.OpOr]; exists {
+		var orConditions []any
+		if ba, ok := orRaw.(bson.A); ok {
+			orConditions = ba
+		} else if arr, ok := orRaw.([]any); ok {
+			orConditions = arr
+		}
+		sumCard := 0
+		for _, cond := range orConditions {
+			if condMap, isM := asMap(cond); isM {
+				card := h.estimateFilterCardinality(colStore, condMap)
+				if card == maxInt {
+					return maxInt
+				}
+				sumCard += card
+			}
+		}
+		return sumCard
+	}
+
+	field, fieldOk := filter["field"].(string)
+	op, opOk := filter["op"].(string)
+	value := filter["value"]
+
+	if fieldOk && opOk && colStore.HasIndex(field) {
+		switch op {
+		case globalconst.OpEqual:
+			return colStore.IndexCount(field, value)
+		case globalconst.OpIn:
+			if values, isSlice := value.(bson.A); isSlice {
+				sum := 0
+				for _, v := range values {
+					sum += colStore.IndexCount(field, v)
+				}
+				return sum
+			}
+		case globalconst.OpGreaterThan:
+			return colStore.IndexRangeCount(field, value, nil, false, false)
+		case globalconst.OpGreaterThanOrEqual:
+			return colStore.IndexRangeCount(field, value, nil, true, false)
+		case globalconst.OpLessThan:
+			return colStore.IndexRangeCount(field, nil, value, false, false)
+		case globalconst.OpLessThanOrEqual:
+			return colStore.IndexRangeCount(field, nil, value, false, true)
+		case globalconst.OpBetween:
+			if bounds, ok := value.(bson.A); ok && len(bounds) == 2 {
+				return colStore.IndexRangeCount(field, bounds[0], bounds[1], true, true)
+			} else if bounds, ok := value.([]any); ok && len(bounds) == 2 {
+				return colStore.IndexRangeCount(field, bounds[0], bounds[1], true, true)
+			}
+		case globalconst.OpLike:
+			if strVal, isStr := value.(string); isStr {
+				if strings.HasSuffix(strVal, "%") && !strings.HasPrefix(strVal, "%") {
+					prefix := strVal[:len(strVal)-1]
+					if !strings.Contains(prefix, "%") {
+						highBound := prefix + "\xff"
+						return colStore.IndexRangeCount(field, prefix, highBound, true, true)
+					}
+				}
+			}
+		}
+	}
+	return maxInt
 }
