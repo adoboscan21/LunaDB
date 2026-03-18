@@ -6,7 +6,7 @@ services:
     ports:
       - "5876:5876" # Map host port
     volumes:
-      - ./collections:/data/collections
+      - ./data:/data/data
       - ./backups:/data/backups
       - ./logs:/data/logs
       - ./json:/data/json
