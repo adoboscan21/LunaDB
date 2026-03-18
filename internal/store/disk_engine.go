@@ -120,28 +120,45 @@ func NewWriteBatcher(db *bbolt.DB) *WriteBatcher {
 }
 
 // Start arranca la gorutina en segundo plano que agrupa y escribe en el disco.
+// OPTIMIZADO: Usa 0% de CPU en reposo gracias a un Temporizador Perezoso (Lazy Timer).
 func (wb *WriteBatcher) Start() {
 	go func() {
 		var batch []*BatchOp
-		// Espera máxima de 5 milisegundos para agrupar peticiones
-		ticker := time.NewTicker(5 * time.Millisecond)
-		defer ticker.Stop()
+		const maxBatch = 2000
+
+		var timeoutCh <-chan time.Time
+		var timer *time.Timer
 
 		for {
 			select {
 			case op := <-wb.ops:
 				batch = append(batch, op)
-				// Si llegamos a 2000 operaciones juntas, escribimos de inmediato
-				if len(batch) >= 2000 {
-					wb.commitBatch(batch)
-					batch = make([]*BatchOp, 0, 2000)
+
+				// Si es el PRIMER elemento del lote, encendemos la cuenta regresiva de 5ms
+				if len(batch) == 1 {
+					timer = time.NewTimer(5 * time.Millisecond)
+					timeoutCh = timer.C
 				}
-			case <-ticker.C:
-				if len(batch) > 0 {
+
+				// Si el lote se llenó a tope, escribimos ya mismo sin esperar los 5ms
+				if len(batch) >= maxBatch {
+					timer.Stop()    // Apagamos el reloj
+					timeoutCh = nil // Desactivamos el canal del select
+
 					wb.commitBatch(batch)
-					batch = make([]*BatchOp, 0, 2000)
+					batch = make([]*BatchOp, 0, maxBatch)
 				}
+
+			case <-timeoutCh:
+				// Pasaron los 5ms y no se llenó el lote. Guardamos lo que haya.
+				wb.commitBatch(batch)
+				batch = make([]*BatchOp, 0, maxBatch)
+				timeoutCh = nil // Volvemos a dormir profundamente (0% CPU)
+
 			case <-wb.quit:
+				if timer != nil {
+					timer.Stop()
+				}
 				if len(batch) > 0 {
 					wb.commitBatch(batch)
 				}
