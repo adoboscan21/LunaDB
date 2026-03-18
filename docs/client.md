@@ -14,7 +14,7 @@ To start the client, you must provide the address of the `lunadb-server`. You ca
 
 **Docker 🐳:**
 
-> `docker exec -it <containerId> ./lunadb-client -u root -p rootpass localhost:5876`
+> `docker exec -it <containerId> lunadb-client -u root -p rootpass localhost:5876`
 
 *💡 Pro-Tip for Payloads: Instead of typing raw JSON strings, ensure you have a `json/` directory in your working path (e.g., `./json/payload.json`). The CLI will auto-resolve filenames passed as arguments, read the file, and convert it to BSON automatically.*
 
