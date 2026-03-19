@@ -496,11 +496,18 @@ func (h *ConnectionHandler) processCollectionQuery(collectionName string, query 
 				}
 
 				if ok && localVal != nil {
-					// Buscar en el índice de la RAM
-					if fKeys, found := foreignColStore.Lookup(lookupSpec.ForeignField, localVal); found && len(fKeys) > 0 {
-						foreignId := fKeys[0] // Tomamos el primer match (One-to-One / Many-to-One)
+					// 🚀 OPTIMIZACIÓN EXTREMA: O(1) Fetch si cruzamos por _id (Primary Key)
+					if lookupSpec.ForeignField == globalconst.ID {
+						foreignId := fmt.Sprintf("%v", localVal)
 						neededForeignKeysMap[foreignId] = struct{}{}
 						localToForeignMap[localVal] = foreignId
+					} else {
+						// Si cruzamos por otro campo, usamos el B-Tree
+						if fKeys, found := foreignColStore.Lookup(lookupSpec.ForeignField, localVal); found && len(fKeys) > 0 {
+							foreignId := fKeys[0] // Tomamos el primer match
+							neededForeignKeysMap[foreignId] = struct{}{}
+							localToForeignMap[localVal] = foreignId
+						}
 					}
 				}
 			}
@@ -1742,7 +1749,7 @@ func asMap(val any) (bson.M, bool) {
 }
 
 // streamAggregations realiza matemáticas directamente sobre el flujo del disco sin almacenar arrays.
-// Utiliza "Lock Striping" para evitar la contención de mutex entre los shards.
+// Utiliza "Lock Striping" y Zero-Allocation BSON Lookups para velocidad extrema.
 func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *Query) (any, error) {
 	var ops []aggOp
 	for alias, agg := range query.Aggregations {
@@ -1753,12 +1760,7 @@ func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *
 		ops = append(ops, aggOp{Alias: alias, Func: agg.Func, Field: agg.Field, ParsedPath: parsed})
 	}
 
-	parsedGroupPaths := make([][]string, len(query.GroupBy))
-	for i, field := range query.GroupBy {
-		parsedGroupPaths[i] = strings.Split(field, ".")
-	}
-
-	// 🔥 OPTIMIZACIÓN: Lock Striping (64 fragmentos para reducir la contención a casi cero)
+	// Lock Striping (64 fragmentos) para paralelismo masivo
 	const numStripes = 64
 	type stripe struct {
 		mu     sync.Mutex
@@ -1769,25 +1771,29 @@ func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *
 		stripes[i].groups = make(map[string]*aggAccumulator)
 	}
 
+	groupFields := query.GroupBy
 	var bufPool = sync.Pool{New: func() any { b := make([]byte, 0, 128); return &b }}
 
 	colStore.StreamAll(func(k string, vBytes []byte) bool {
+		// Envoltura directa sin asignación de memoria
 		item := bson.Raw(vBytes)
 
 		bp := bufPool.Get().(*[]byte)
 		keyBuffer := (*bp)[:0]
 
-		if len(query.GroupBy) == 0 {
+		// 1. Construir llave de agrupación
+		if len(groupFields) == 0 {
 			keyBuffer = append(keyBuffer, "_no_group_"...)
 		} else {
-			for i := range query.GroupBy {
+			for i, gf := range groupFields {
 				if i > 0 {
 					keyBuffer = append(keyBuffer, '|')
 				}
-				val, err := item.LookupErr(parsedGroupPaths[i]...)
-				if err == nil && val.Type != bsontype.Null {
-					keyBuffer = append(keyBuffer, byte(val.Type))
-					keyBuffer = append(keyBuffer, val.Value...)
+				// LookupErr no asigna memoria (Costo O(N) muy barato sobre bytes)
+				gv, err := item.LookupErr(gf)
+				if err == nil && gv.Type != bsontype.Null {
+					keyBuffer = append(keyBuffer, byte(gv.Type))
+					keyBuffer = append(keyBuffer, gv.Value...)
 				} else {
 					keyBuffer = append(keyBuffer, 0)
 				}
@@ -1797,7 +1803,7 @@ func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *
 		groupStrKey := string(keyBuffer)
 		bufPool.Put(bp)
 
-		// Hashing ultra rápido para elegir el fragmento (Stripe)
+		// 2. Hashing ultra rápido para elegir el fragmento (Stripe)
 		hash := 0
 		for i := 0; i < len(groupStrKey); i++ {
 			hash = 31*hash + int(groupStrKey[i])
@@ -1807,18 +1813,15 @@ func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *
 		}
 		stripeIdx := hash % numStripes
 
-		// Bloqueamos SOLO la fracción del mapa que nos interesa
 		myStripe := &stripes[stripeIdx]
 		myStripe.mu.Lock()
 
 		acc, exists := myStripe.groups[groupStrKey]
 		if !exists {
-			groupVals := make([]any, len(query.GroupBy))
-			if len(query.GroupBy) > 0 {
-				for i := range query.GroupBy {
-					if val, err := item.LookupErr(parsedGroupPaths[i]...); err == nil && val.Type != bsontype.Null {
-						groupVals[i] = extractBsonRawValue(val)
-					}
+			groupVals := make([]any, len(groupFields))
+			for i, gf := range groupFields {
+				if gv, err := item.LookupErr(gf); err == nil && gv.Type != bsontype.Null {
+					groupVals[i] = extractBsonRawValue(gv)
 				}
 			}
 			acc = &aggAccumulator{
@@ -1833,6 +1836,7 @@ func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *
 		}
 		acc.Count++
 
+		// 3. Cálculos matemáticos
 		for i, op := range ops {
 			if op.Field == "*" {
 				if op.Func == globalconst.AggCount {
@@ -1887,7 +1891,7 @@ func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *
 		return true
 	})
 
-	// Consolidar todos los fragmentos
+	// Consolidar resultados (igual que antes)
 	var aggregatedResults []bson.M
 	for s := 0; s < numStripes; s++ {
 		for groupKey, acc := range stripes[s].groups {

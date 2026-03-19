@@ -173,8 +173,8 @@ func main() {
 
 	// Worker para liberar memoria inactiva del SO (Relevante para el GC de Go)
 	go func() {
-		checkInterval := 2 * time.Minute
-		idleThreshold := 5 * time.Minute
+		checkInterval := 1 * time.Minute
+		idleThreshold := 2 * time.Minute
 		ticker := time.NewTicker(checkInterval)
 		defer ticker.Stop()
 		slog.Info("Starting idle memory cleaner", "check_interval", checkInterval.String(), "idle_threshold", idleThreshold.String())
