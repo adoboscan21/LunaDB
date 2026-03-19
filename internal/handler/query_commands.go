@@ -68,6 +68,11 @@ func (h *ConnectionHandler) handleCollectionQuery(r io.Reader, conn net.Conn) {
 		return
 	}
 
+	maxLimit := 1000
+	if query.Limit == nil || *query.Limit > maxLimit {
+		query.Limit = &maxLimit
+	}
+
 	slog.Debug("Processing collection query", "user", h.AuthenticatedUser, "collection", collectionName)
 
 	results, err := h.processCollectionQuery(collectionName, query)
