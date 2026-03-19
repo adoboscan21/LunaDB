@@ -1742,6 +1742,7 @@ func asMap(val any) (bson.M, bool) {
 }
 
 // streamAggregations realiza matemáticas directamente sobre el flujo del disco sin almacenar arrays.
+// Utiliza "Lock Striping" para evitar la contención de mutex entre los shards.
 func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *Query) (any, error) {
 	var ops []aggOp
 	for alias, agg := range query.Aggregations {
@@ -1757,10 +1758,17 @@ func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *
 		parsedGroupPaths[i] = strings.Split(field, ".")
 	}
 
-	groups := make(map[string]*aggAccumulator)
-	var mu sync.Mutex // <--- Mutex para el mapa
+	// 🔥 OPTIMIZACIÓN: Lock Striping (64 fragmentos para reducir la contención a casi cero)
+	const numStripes = 64
+	type stripe struct {
+		mu     sync.Mutex
+		groups map[string]*aggAccumulator
+	}
+	stripes := make([]stripe, numStripes)
+	for i := 0; i < numStripes; i++ {
+		stripes[i].groups = make(map[string]*aggAccumulator)
+	}
 
-	// Pool de buffers para mantener 0 asignaciones de memoria bajo concurrencia extrema
 	var bufPool = sync.Pool{New: func() any { b := make([]byte, 0, 128); return &b }}
 
 	colStore.StreamAll(func(k string, vBytes []byte) bool {
@@ -1787,10 +1795,23 @@ func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *
 		}
 
 		groupStrKey := string(keyBuffer)
-		bufPool.Put(bp) // Devolvemos el buffer limpio
+		bufPool.Put(bp)
 
-		mu.Lock()
-		acc, exists := groups[groupStrKey]
+		// Hashing ultra rápido para elegir el fragmento (Stripe)
+		hash := 0
+		for i := 0; i < len(groupStrKey); i++ {
+			hash = 31*hash + int(groupStrKey[i])
+		}
+		if hash < 0 {
+			hash = -hash
+		}
+		stripeIdx := hash % numStripes
+
+		// Bloqueamos SOLO la fracción del mapa que nos interesa
+		myStripe := &stripes[stripeIdx]
+		myStripe.mu.Lock()
+
+		acc, exists := myStripe.groups[groupStrKey]
 		if !exists {
 			groupVals := make([]any, len(query.GroupBy))
 			if len(query.GroupBy) > 0 {
@@ -1808,7 +1829,7 @@ func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *
 				Counts:      make([]int, len(ops)),
 				HasVal:      make([]bool, len(ops)),
 			}
-			groups[groupStrKey] = acc
+			myStripe.groups[groupStrKey] = acc
 		}
 		acc.Count++
 
@@ -1862,59 +1883,62 @@ func (h *ConnectionHandler) streamAggregations(colStore store.DataStore, query *
 				}
 			}
 		}
-		mu.Unlock()
+		myStripe.mu.Unlock()
 		return true
 	})
 
+	// Consolidar todos los fragmentos
 	var aggregatedResults []bson.M
-	for groupKey, acc := range groups {
-		resultRow := make(bson.M)
-		if len(query.GroupBy) > 0 && groupKey != "_no_group_" {
-			for i, field := range query.GroupBy {
-				setNestedValue(resultRow, field, acc.GroupValues[i])
-			}
-		}
-
-		for i, op := range ops {
-			var finalVal any
-			switch op.Func {
-			case globalconst.AggCount:
-				finalVal = acc.Counts[i]
-			case globalconst.AggSum:
-				if acc.HasVal[i] || acc.Counts[i] > 0 {
-					finalVal = acc.Sums[i]
-				} else {
-					finalVal = nil
-				}
-			case globalconst.AggAvg:
-				if acc.Counts[i] > 0 {
-					finalVal = acc.Sums[i] / float64(acc.Counts[i])
-				} else {
-					finalVal = nil
-				}
-			case globalconst.AggMin:
-				if acc.HasVal[i] {
-					finalVal = acc.Mins[i]
-				} else {
-					finalVal = nil
-				}
-			case globalconst.AggMax:
-				if acc.HasVal[i] {
-					finalVal = acc.Maxs[i]
-				} else {
-					finalVal = nil
+	for s := 0; s < numStripes; s++ {
+		for groupKey, acc := range stripes[s].groups {
+			resultRow := make(bson.M)
+			if len(query.GroupBy) > 0 && groupKey != "_no_group_" {
+				for i, field := range query.GroupBy {
+					setNestedValue(resultRow, field, acc.GroupValues[i])
 				}
 			}
-			resultRow[op.Alias] = finalVal
-		}
 
-		if len(query.Having) > 0 {
-			rowBytes, _ := bson.Marshal(resultRow)
-			if h.matchFilter(rowBytes, query.Having) {
+			for i, op := range ops {
+				var finalVal any
+				switch op.Func {
+				case globalconst.AggCount:
+					finalVal = acc.Counts[i]
+				case globalconst.AggSum:
+					if acc.HasVal[i] || acc.Counts[i] > 0 {
+						finalVal = acc.Sums[i]
+					} else {
+						finalVal = nil
+					}
+				case globalconst.AggAvg:
+					if acc.Counts[i] > 0 {
+						finalVal = acc.Sums[i] / float64(acc.Counts[i])
+					} else {
+						finalVal = nil
+					}
+				case globalconst.AggMin:
+					if acc.HasVal[i] {
+						finalVal = acc.Mins[i]
+					} else {
+						finalVal = nil
+					}
+				case globalconst.AggMax:
+					if acc.HasVal[i] {
+						finalVal = acc.Maxs[i]
+					} else {
+						finalVal = nil
+					}
+				}
+				resultRow[op.Alias] = finalVal
+			}
+
+			if len(query.Having) > 0 {
+				rowBytes, _ := bson.Marshal(resultRow)
+				if h.matchFilter(rowBytes, query.Having) {
+					aggregatedResults = append(aggregatedResults, resultRow)
+				}
+			} else {
 				aggregatedResults = append(aggregatedResults, resultRow)
 			}
-		} else {
-			aggregatedResults = append(aggregatedResults, resultRow)
 		}
 	}
 	return aggregatedResults, nil
@@ -2009,4 +2033,50 @@ func (h *ConnectionHandler) estimateFilterCardinality(colStore store.DataStore, 
 		}
 	}
 	return maxInt
+}
+
+// executeQueryForKeys es un Fast-Path que devuelve SOLO las llaves que hacen match con el query.
+// ¡Cero reflexiones, Cero BSON Unmarshal!
+func (h *ConnectionHandler) executeQueryForKeys(collectionName string, query *Query) ([]string, error) {
+	colStore := h.CollectionManager.GetCollection(collectionName)
+	var matchKeys []string
+
+	candidateKeys, usedIndex, remainingFilter := h.findCandidateKeysFromFilter(colStore, query.Filter)
+	compiledEvaluator := h.compileFilter(remainingFilter)
+
+	if usedIndex {
+		uniqueKeys := make(map[string]struct{}, len(candidateKeys))
+		for _, k := range candidateKeys {
+			if _, exists := uniqueKeys[k]; !exists {
+				uniqueKeys[k] = struct{}{}
+
+				// Si el índice cubrió todo el filtro, no necesitamos leer el documento
+				if len(remainingFilter) == 0 {
+					matchKeys = append(matchKeys, k)
+				} else if vBytes, found := colStore.Get(k); found {
+					// Si hay filtros restantes, evaluamos en binario crudo
+					if compiledEvaluator(bson.Raw(vBytes)) {
+						matchKeys = append(matchKeys, k)
+					}
+				}
+			}
+		}
+	} else {
+		// Full Table Scan optimizado en binario crudo
+		colStore.StreamAll(func(k string, vBytes []byte) bool {
+			if compiledEvaluator(bson.Raw(vBytes)) {
+				matchKeys = append(matchKeys, k)
+			}
+			return true
+		})
+	}
+
+	// Aplicar Offset y Limit a las llaves si es necesario
+	offset := min(max(query.Offset, 0), len(matchKeys))
+	matchKeys = matchKeys[offset:]
+	if query.Limit != nil && *query.Limit >= 0 && *query.Limit < len(matchKeys) {
+		matchKeys = matchKeys[:*query.Limit]
+	}
+
+	return matchKeys, nil
 }

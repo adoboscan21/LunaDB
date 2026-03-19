@@ -77,9 +77,9 @@ func (s *DiskStore) Set(key string, value []byte) {
 	}
 }
 
-// SetMany guarda múltiples ítems y sus índices agrupándolos por partición.
-func (s *DiskStore) SetMany(items map[string][]byte) {
-	now := time.Now()
+// SetMany guarda múltiples ítems y sus índices insertando en paralelo por partición.
+func (s *DiskStore) SetMany(items map[string][]byte) (int, int) {
+	now := time.Now().UTC()
 	indexedFields := s.indexes.ListIndexes()
 
 	// 1. Agrupar ítems por Shard
@@ -92,27 +92,54 @@ func (s *DiskStore) SetMany(items map[string][]byte) {
 		shardItems[shardID][key] = value
 	}
 
-	// 2. Escribir en disco por cada Shard
-	for shardID, sItems := range shardItems {
-		db := GlobalDBs[shardID]
-		db.Update(func(tx *bbolt.Tx) error {
-			b := tx.Bucket(s.collectionName)
-			for key, value := range sItems {
-				recordBytes, _ := bson.Marshal(ItemRecord{Value: value, CreatedAt: now})
-				b.Put([]byte(key), recordBytes)
+	var insertedCount, duplicateCount int32
+	var wg sync.WaitGroup
 
-				newDataForIndex := extractIndexedValues(value, indexedFields)
-				for field, val := range newDataForIndex {
-					idxKey := encodeIndexKey(val, key)
-					if idxKey != nil {
-						idxB, _ := tx.CreateBucketIfNotExists([]byte("_idx_" + string(s.collectionName) + "_" + field))
-						idxB.Put(idxKey, []byte{})
+	// 2. Escribir en disco por cada Shard en PARALELO
+	for shardID, sItems := range shardItems {
+		wg.Add(1)
+		go func(sID int, itemsForShard map[string][]byte) {
+			defer wg.Done()
+			db := GlobalDBs[sID]
+			var localInserted, localDuplicated int32
+
+			db.Update(func(tx *bbolt.Tx) error {
+				b, _ := tx.CreateBucketIfNotExists(s.collectionName)
+
+				for key, value := range itemsForShard {
+					// Verificación O(1) en RAM/mmap (¡Muchísimo más rápido que un db.View() externo!)
+					if b.Get([]byte(key)) != nil {
+						localDuplicated++
+						continue
 					}
+
+					// Serialización optimizada con bson.D (Sin reflexión de mapas)
+					recordBytes, _ := bson.Marshal(bson.D{
+						{Key: "v", Value: value},
+						{Key: "c", Value: now},
+					})
+					b.Put([]byte(key), recordBytes)
+
+					newDataForIndex := extractIndexedValues(value, indexedFields)
+					for field, val := range newDataForIndex {
+						idxKey := encodeIndexKey(val, key)
+						if idxKey != nil {
+							idxB, _ := tx.CreateBucketIfNotExists([]byte("_idx_" + string(s.collectionName) + "_" + field))
+							idxB.Put(idxKey, []byte{})
+						}
+					}
+					localInserted++
 				}
-			}
-			return nil
-		})
+				return nil
+			})
+
+			atomic.AddInt32(&insertedCount, localInserted)
+			atomic.AddInt32(&duplicateCount, localDuplicated)
+		}(shardID, sItems)
 	}
+
+	wg.Wait()
+	return int(insertedCount), int(duplicateCount)
 }
 
 // Delete borra un registro y sus entradas de índice apuntando directamente a la partición correcta.
@@ -147,43 +174,71 @@ func (s *DiskStore) Delete(key string) {
 	}
 }
 
-// DeleteMany borra múltiples ítems y sus índices agrupándolos por partición.
+// DeleteMany borra múltiples ítems y sus índices agrupándolos por partición (Optimización Secuencial).
 func (s *DiskStore) DeleteMany(keys []string) {
 	indexedFields := s.indexes.ListIndexes()
 
+	// 1. Enrutamiento por Shard (Igual que antes)
 	shardKeys := make(map[int][]string)
 	for _, key := range keys {
 		shardID := GetShardID(key, TotalShards)
 		shardKeys[shardID] = append(shardKeys[shardID], key)
 	}
 
+	var wg sync.WaitGroup
+
+	// 2. Procesamiento concurrente por Shard
 	for shardID, sKeys := range shardKeys {
-		db := GlobalDBs[shardID]
-		db.Update(func(tx *bbolt.Tx) error {
-			b := tx.Bucket(s.collectionName)
-			if b == nil {
-				return nil
-			}
-			for _, k := range sKeys {
-				if oldVal := b.Get([]byte(k)); oldVal != nil {
-					var record ItemRecord
-					if bson.Unmarshal(oldVal, &record) == nil {
-						oldData := extractIndexedValues(record.Value, indexedFields)
-						for field, val := range oldData {
-							idxKey := encodeIndexKey(val, k)
-							if idxKey != nil {
-								if idxB := tx.Bucket([]byte("_idx_" + string(s.collectionName) + "_" + field)); idxB != nil {
-									idxB.Delete(idxKey)
+		wg.Add(1)
+		go func(sID int, keysForShard []string) {
+			defer wg.Done()
+			db := GlobalDBs[sID]
+
+			db.Update(func(tx *bbolt.Tx) error {
+				b := tx.Bucket(s.collectionName)
+				if b == nil {
+					return nil
+				}
+
+				// Diccionarios para agrupar TODOS los índices a borrar antes de tocar los buckets
+				indexDeletes := make(map[string][][]byte)
+
+				// Fase 1: Recolección y Eliminación del Documento Principal
+				for _, k := range keysForShard {
+					keyBytes := []byte(k)
+					if oldVal := b.Get(keyBytes); oldVal != nil {
+						var record ItemRecord
+						// Fast-path: Unmarshal mínimo si es posible.
+						// Para este ejemplo, mantendremos Unmarshal para asegurar que extraemos bien los datos indexados.
+						if bson.Unmarshal(oldVal, &record) == nil {
+							oldData := extractIndexedValues(record.Value, indexedFields)
+							for field, val := range oldData {
+								if idxKey := encodeIndexKey(val, k); idxKey != nil {
+									indexDeletes[field] = append(indexDeletes[field], idxKey)
 								}
 							}
 						}
 					}
+					b.Delete(keyBytes) // Borrado del dato crudo
 				}
-				b.Delete([]byte(k))
-			}
-			return nil
-		})
+
+				// Fase 2: Borrado en Lote de Índices
+				// Al hacer esto separado, bbolt no brinca entre el bucket principal y los de índices.
+				// Esto maximiza la retención en caché L1/L2 del procesador.
+				for field, idxKeys := range indexDeletes {
+					idxBName := []byte("_idx_" + string(s.collectionName) + "_" + field)
+					idxB := tx.Bucket(idxBName)
+					if idxB != nil {
+						for _, idxKey := range idxKeys {
+							idxB.Delete(idxKey)
+						}
+					}
+				}
+				return nil
+			})
+		}(shardID, sKeys)
 	}
+	wg.Wait()
 }
 
 // Get lee el documento buscando directamente en el Shard correcto en O(1).
@@ -295,10 +350,12 @@ func (s *DiskStore) Update(key string, newValue []byte) bool {
 	return true
 }
 
-// UpdateMany actualiza múltiples ítems e índices ruteando por partición.
+// UpdateMany actualiza múltiples ítems e índices ruteando por partición (Optimización Secuencial).
 func (s *DiskStore) UpdateMany(items map[string][]byte) (int, []string) {
-	updatedCount := 0
+	var updatedCount int32
 	var failedKeys []string
+	var mu sync.Mutex // Para proteger failedKeys en concurrencia
+
 	indexedFields := s.indexes.ListIndexes()
 
 	shardItems := make(map[int]map[string][]byte)
@@ -310,55 +367,96 @@ func (s *DiskStore) UpdateMany(items map[string][]byte) (int, []string) {
 		shardItems[shardID][key] = value
 	}
 
+	var wg sync.WaitGroup
+
 	for shardID, sItems := range shardItems {
-		db := GlobalDBs[shardID]
-		db.Update(func(tx *bbolt.Tx) error {
-			b := tx.Bucket(s.collectionName)
-			for key, newValue := range sItems {
-				existing := b.Get([]byte(key))
-				if existing == nil {
-					failedKeys = append(failedKeys, key)
-					continue
+		wg.Add(1)
+		go func(sID int, itemsForShard map[string][]byte) {
+			defer wg.Done()
+			db := GlobalDBs[sID]
+
+			var localUpdated int32
+			var localFailed []string
+
+			db.Update(func(tx *bbolt.Tx) error {
+				b := tx.Bucket(s.collectionName)
+				if b == nil {
+					return nil
 				}
 
-				var oldRecord ItemRecord
-				bson.Unmarshal(existing, &oldRecord)
+				// Agrupadores de índices
+				indexDeletes := make(map[string][][]byte)
+				indexInserts := make(map[string][][]byte)
 
-				recordBytes, _ := bson.Marshal(ItemRecord{Value: newValue, CreatedAt: oldRecord.CreatedAt})
+				for key, newValue := range itemsForShard {
+					keyBytes := []byte(key)
+					existing := b.Get(keyBytes)
+					if existing == nil {
+						localFailed = append(localFailed, key)
+						continue
+					}
 
-				if err := b.Put([]byte(key), recordBytes); err == nil {
-					updatedCount++
+					var oldRecord ItemRecord
+					bson.Unmarshal(existing, &oldRecord)
 
-					// Reemplazo de índices en disco
-					oldData := extractIndexedValues(oldRecord.Value, indexedFields)
-					newData := extractIndexedValues(newValue, indexedFields)
+					recordBytes, _ := bson.Marshal(ItemRecord{Value: newValue, CreatedAt: oldRecord.CreatedAt})
 
-					for field := range oldData {
-						if oldData[field] != newData[field] {
-							if oldK := encodeIndexKey(oldData[field], key); oldK != nil {
-								if idxB := tx.Bucket([]byte("_idx_" + string(s.collectionName) + "_" + field)); idxB != nil {
-									idxB.Delete(oldK)
+					if err := b.Put(keyBytes, recordBytes); err == nil {
+						localUpdated++
+
+						oldData := extractIndexedValues(oldRecord.Value, indexedFields)
+						newData := extractIndexedValues(newValue, indexedFields)
+
+						for field := range oldData {
+							if oldData[field] != newData[field] {
+								if oldK := encodeIndexKey(oldData[field], key); oldK != nil {
+									indexDeletes[field] = append(indexDeletes[field], oldK)
 								}
 							}
 						}
-					}
-					for field, val := range newData {
-						if oldData[field] != val {
-							if newK := encodeIndexKey(val, key); newK != nil {
-								idxB, _ := tx.CreateBucketIfNotExists([]byte("_idx_" + string(s.collectionName) + "_" + field))
-								idxB.Put(newK, []byte{})
+						for field, val := range newData {
+							if oldData[field] != val {
+								if newK := encodeIndexKey(val, key); newK != nil {
+									indexInserts[field] = append(indexInserts[field], newK)
+								}
 							}
 						}
+					} else {
+						localFailed = append(localFailed, key)
 					}
-				} else {
-					failedKeys = append(failedKeys, key)
 				}
+
+				// Procesar purgas de índices masivas
+				for field, keys := range indexDeletes {
+					if idxB := tx.Bucket([]byte("_idx_" + string(s.collectionName) + "_" + field)); idxB != nil {
+						for _, k := range keys {
+							idxB.Delete(k)
+						}
+					}
+				}
+
+				// Procesar inserciones de índices masivas
+				for field, keys := range indexInserts {
+					idxB, _ := tx.CreateBucketIfNotExists([]byte("_idx_" + string(s.collectionName) + "_" + field))
+					for _, k := range keys {
+						idxB.Put(k, []byte{})
+					}
+				}
+
+				return nil
+			})
+
+			atomic.AddInt32(&updatedCount, localUpdated)
+			if len(localFailed) > 0 {
+				mu.Lock()
+				failedKeys = append(failedKeys, localFailed...)
+				mu.Unlock()
 			}
-			return nil
-		})
+		}(shardID, sItems)
 	}
 
-	return updatedCount, failedKeys
+	wg.Wait()
+	return int(updatedCount), failedKeys
 }
 
 // =========================================================

@@ -1,7 +1,6 @@
 package handler
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"log/slog"
@@ -348,7 +347,7 @@ func (h *ConnectionHandler) HandleCollectionItemSetMany(r io.Reader, conn net.Co
 	elements, _ := rawArray.Array().Elements()
 
 	colStore := h.CollectionManager.GetCollection(collectionName)
-	processedCount, invalidCount, duplicateCount := 0, 0, 0
+	var processedCount, duplicateCount, invalidCount int
 	now := time.Now().UTC()
 
 	// Mapa masivo para inserción
@@ -366,32 +365,22 @@ func (h *ConnectionHandler) HandleCollectionItemSetMany(r io.Reader, conn net.Co
 			key = uuid.New().String()
 		}
 
-		if h.CurrentTransactionID == "" {
-			if _, exists := colStore.Get(key); exists {
-				duplicateCount++
-				continue
-			}
-		}
-
-		var m bson.M
-		bson.Unmarshal(doc, &m)
-		m[globalconst.ID] = key
-		m[globalconst.CREATED_AT] = now
-		m[globalconst.UPDATED_AT] = now
-		newDocBytes, _ := bson.Marshal(m)
+		// 🔥 Usamos nuestro Fast-Path para inyectar los metadatos sin usar bson.M
+		newDocBytes := enrichBSONForInsertFast(doc, key, now)
 
 		if h.CurrentTransactionID != "" {
 			op := store.WriteOperation{Collection: collectionName, Key: key, Value: newDocBytes, OpType: store.OpTypeSet}
 			h.TransactionManager.RecordWrite(h.CurrentTransactionID, op)
+			processedCount++
 		} else {
 			itemsToSet[key] = newDocBytes
 		}
-		processedCount++
 	}
 
 	// Delegar inserción masiva a la capa de disco
 	if h.CurrentTransactionID == "" && len(itemsToSet) > 0 {
-		colStore.SetMany(itemsToSet)
+		// 🔥 Recuperamos los contadores precisos directo del disco
+		processedCount, duplicateCount = colStore.SetMany(itemsToSet)
 	} else if h.CurrentTransactionID != "" {
 		protocol.WriteResponse(conn, protocol.StatusOk, fmt.Sprintf("OK: %d set ops queued in transaction.", processedCount), nil)
 		return
@@ -471,7 +460,7 @@ func applyBSONPatchFast(existingValue []byte, patchData bson.M, now time.Time) (
 	return bson.Marshal(newDoc)
 }
 
-// HandleCollectionUpdateWhere processes the CmdCollectionUpdateWhere command.
+// HandleCollectionUpdateWhere processes the CmdCollectionUpdateWhere command natively.
 func (h *ConnectionHandler) HandleCollectionUpdateWhere(r io.Reader, conn net.Conn) {
 	collectionName, queryBSON, patchBSON, err := protocol.ReadCollectionUpdateWhereCommand(r)
 	if err != nil || collectionName == "" {
@@ -490,51 +479,80 @@ func (h *ConnectionHandler) HandleCollectionUpdateWhere(r io.Reader, conn net.Co
 		return
 	}
 
-	// Forzamos la proyección para solo traer el _id y ahorrar RAM
-	query.Projection = []string{globalconst.ID}
-
-	results, err := h.processCollectionQuery(collectionName, query)
+	// 🔥 USAMOS EL FAST-PATH ZERO-ALLOCATION
+	keys, err := h.executeQueryForKeys(collectionName, query)
 	if err != nil {
 		protocol.WriteResponse(conn, protocol.StatusError, "Failed to execute query", nil)
 		return
 	}
 
-	docs, ok := results.([]bson.M)
-	if !ok || len(docs) == 0 {
+	if len(keys) == 0 {
 		protocol.WriteResponse(conn, protocol.StatusOk, "OK: 0 items matched the condition.", nil)
 		return
 	}
 
-	// Transformamos los resultados al formato que espera HandleCollectionItemUpdateMany
-	var payload struct {
-		Array []updateManyPayload `bson:"array"`
-	}
-
 	var patchData bson.M
-	bson.Unmarshal(patchBSON, &patchData)
-
-	for _, doc := range docs {
-		if idVal, exists := doc[globalconst.ID]; exists {
-			payload.Array = append(payload.Array, updateManyPayload{
-				ID:    idVal.(string),
-				Patch: patchData,
-			})
-		}
+	if err := bson.Unmarshal(patchBSON, &patchData); err != nil {
+		protocol.WriteResponse(conn, protocol.StatusBadRequest, "Invalid patch format", nil)
+		return
 	}
 
-	payloadBSON, _ := bson.Marshal(payload)
+	colStore := h.CollectionManager.GetCollection(collectionName)
+	now := time.Now().UTC()
+	itemsToUpdate := make(map[string][]byte, len(keys))
+	var failedKeys []string
 
-	// Reutilizamos tu comando de Bulk Update pasando el BSON simulado
-	var buf bytes.Buffer
-	protocol.WriteCollectionItemUpdateManyCommand(&buf, collectionName, payloadBSON)
+	// Lógica Transaccional
+	if h.CurrentTransactionID != "" {
+		for _, key := range keys {
+			existingValue, found := colStore.Get(key)
+			if !found {
+				continue
+			}
 
-	// CORRECCIÓN: Solo descartamos 1 byte (el ID del comando).
-	// La función llamada abajo SÍ necesita leer el nombre de la colección del buffer.
-	buf.Next(1)
-	h.HandleCollectionItemUpdateMany(&buf, conn)
+			var existingData bson.M
+			bson.Unmarshal(existingValue, &existingData)
+			for k, v := range patchData {
+				if k != globalconst.ID && k != globalconst.CREATED_AT {
+					existingData[k] = v
+				}
+			}
+			finalValue, _ := bson.Marshal(existingData)
+			op := store.WriteOperation{Collection: collectionName, Key: key, Value: finalValue, OpType: store.OpTypeUpdate}
+			h.TransactionManager.RecordWrite(h.CurrentTransactionID, op)
+		}
+		protocol.WriteResponse(conn, protocol.StatusOk, fmt.Sprintf("OK: %d update ops queued in transaction.", len(keys)), nil)
+		return
+	}
+
+	// Fast Path: Aplicar parches en RAM y encolar
+	for _, key := range keys {
+		existingValue, found := colStore.Get(key)
+		if !found {
+			failedKeys = append(failedKeys, key)
+			continue
+		}
+
+		updatedValue, err := applyBSONPatchFast(existingValue, patchData, now)
+		if err != nil {
+			failedKeys = append(failedKeys, key)
+			continue
+		}
+		itemsToUpdate[key] = updatedValue
+	}
+
+	updatedCount := 0
+	if len(itemsToUpdate) > 0 {
+		var diskFailedKeys []string
+		updatedCount, diskFailedKeys = colStore.UpdateMany(itemsToUpdate)
+		failedKeys = append(failedKeys, diskFailedKeys...)
+	}
+
+	msg := fmt.Sprintf("OK: %d items updated. %d failed.", updatedCount, len(failedKeys))
+	protocol.WriteResponse(conn, protocol.StatusOk, msg, nil)
 }
 
-// HandleCollectionDeleteWhere processes the CmdCollectionDeleteWhere command.
+// HandleCollectionDeleteWhere processes the CmdCollectionDeleteWhere command natively.
 func (h *ConnectionHandler) HandleCollectionDeleteWhere(r io.Reader, conn net.Conn) {
 	collectionName, queryBSON, err := protocol.ReadCollectionDeleteWhereCommand(r)
 	if err != nil || collectionName == "" {
@@ -553,31 +571,65 @@ func (h *ConnectionHandler) HandleCollectionDeleteWhere(r io.Reader, conn net.Co
 		return
 	}
 
-	query.Projection = []string{globalconst.ID}
-
-	results, err := h.processCollectionQuery(collectionName, query)
+	// 🔥 USAMOS EL FAST-PATH ZERO-ALLOCATION
+	keys, err := h.executeQueryForKeys(collectionName, query)
 	if err != nil {
 		protocol.WriteResponse(conn, protocol.StatusError, "Failed to execute query", nil)
 		return
 	}
 
-	docs, ok := results.([]bson.M)
-	if !ok || len(docs) == 0 {
+	if len(keys) == 0 {
 		protocol.WriteResponse(conn, protocol.StatusOk, "OK: 0 items matched the condition.", nil)
 		return
 	}
 
-	var keys []string
-	for _, doc := range docs {
-		if idVal, exists := doc[globalconst.ID]; exists {
-			keys = append(keys, idVal.(string))
+	if h.CurrentTransactionID != "" {
+		for _, key := range keys {
+			op := store.WriteOperation{Collection: collectionName, Key: key, OpType: store.OpTypeDelete}
+			h.TransactionManager.RecordWrite(h.CurrentTransactionID, op)
 		}
+		protocol.WriteResponse(conn, protocol.StatusOk, fmt.Sprintf("OK: %d delete ops queued in transaction.", len(keys)), nil)
+		return
 	}
 
-	var buf bytes.Buffer
-	protocol.WriteCollectionItemDeleteManyCommand(&buf, collectionName, keys)
+	// Enviamos el array nativo directamente a la capa de disco
+	colStore := h.CollectionManager.GetCollection(collectionName)
+	colStore.DeleteMany(keys)
 
-	// CORRECCIÓN: Solo descartamos 1 byte.
-	buf.Next(1)
-	h.HandleCollectionItemDeleteMany(&buf, conn)
+	protocol.WriteResponse(conn, protocol.StatusOk, fmt.Sprintf("OK: %d items deleted.", len(keys)), nil)
+}
+
+// enrichBSONForInsertFast inyecta _id y timestamps sin usar reflexión costosa de mapas.
+func enrichBSONForInsertFast(rawDoc bson.Raw, id string, now time.Time) []byte {
+	elements, _ := rawDoc.Elements()
+	newDoc := make(bson.D, 0, len(elements)+3)
+
+	hasID, hasCreated, hasUpdated := false, false, false
+
+	for _, elem := range elements {
+		key := elem.Key()
+		if key == globalconst.ID {
+			hasID = true
+		}
+		if key == globalconst.CREATED_AT {
+			hasCreated = true
+		}
+		if key == globalconst.UPDATED_AT {
+			hasUpdated = true
+		}
+		newDoc = append(newDoc, bson.E{Key: key, Value: elem.Value()})
+	}
+
+	if !hasID {
+		newDoc = append(newDoc, bson.E{Key: globalconst.ID, Value: id})
+	}
+	if !hasCreated {
+		newDoc = append(newDoc, bson.E{Key: globalconst.CREATED_AT, Value: now})
+	}
+	if !hasUpdated {
+		newDoc = append(newDoc, bson.E{Key: globalconst.UPDATED_AT, Value: now})
+	}
+
+	bytes, _ := bson.Marshal(newDoc)
+	return bytes
 }

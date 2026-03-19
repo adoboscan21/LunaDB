@@ -13,7 +13,7 @@ type ItemRecord struct {
 
 type DataStore interface {
 	Set(key string, value []byte)
-	SetMany(items map[string][]byte)
+	SetMany(items map[string][]byte) (int, int)
 	Get(key string) ([]byte, bool)
 	GetMany(keys []string) map[string][]byte
 	Delete(key string)

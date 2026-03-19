@@ -124,7 +124,7 @@ func NewWriteBatcher(db *bbolt.DB) *WriteBatcher {
 func (wb *WriteBatcher) Start() {
 	go func() {
 		var batch []*BatchOp
-		const maxBatch = 2000
+		const maxBatch = 10000
 
 		var timeoutCh <-chan time.Time
 		var timer *time.Timer
