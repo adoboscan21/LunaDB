@@ -460,7 +460,7 @@ func applyBSONPatchFast(existingValue []byte, patchData bson.M, now time.Time) (
 	return bson.Marshal(newDoc)
 }
 
-// HandleCollectionUpdateWhere processes the CmdCollectionUpdateWhere command natively.
+// HandleCollectionUpdateWhere processes the CmdCollectionUpdateWhere command natively using Streaming Mutations.
 func (h *ConnectionHandler) HandleCollectionUpdateWhere(r io.Reader, conn net.Conn) {
 	collectionName, queryBSON, patchBSON, err := protocol.ReadCollectionUpdateWhereCommand(r)
 	if err != nil || collectionName == "" {
@@ -479,7 +479,7 @@ func (h *ConnectionHandler) HandleCollectionUpdateWhere(r io.Reader, conn net.Co
 		return
 	}
 
-	// 🔥 USAMOS EL FAST-PATH ZERO-ALLOCATION
+	// Extraemos solo las llaves (strings ligeros, bajo consumo de RAM)
 	keys, err := h.executeQueryForKeys(collectionName, query)
 	if err != nil {
 		protocol.WriteResponse(conn, protocol.StatusError, "Failed to execute query", nil)
@@ -499,10 +499,11 @@ func (h *ConnectionHandler) HandleCollectionUpdateWhere(r io.Reader, conn net.Co
 
 	colStore := h.CollectionManager.GetCollection(collectionName)
 	now := time.Now().UTC()
-	itemsToUpdate := make(map[string][]byte, len(keys))
+
+	var totalUpdated int
 	var failedKeys []string
 
-	// Lógica Transaccional
+	// Lógica Transaccional (ACID Estricto en memoria antes del Commit)
 	if h.CurrentTransactionID != "" {
 		for _, key := range keys {
 			existingValue, found := colStore.Get(key)
@@ -525,34 +526,50 @@ func (h *ConnectionHandler) HandleCollectionUpdateWhere(r io.Reader, conn net.Co
 		return
 	}
 
-	// Fast Path: Aplicar parches en RAM y encolar
-	for _, key := range keys {
-		existingValue, found := colStore.Get(key)
-		if !found {
-			failedKeys = append(failedKeys, key)
-			continue
+	// 🚀 FAST PATH: Streaming Mutations (Procesamiento por Lotes / Chunks)
+	// Mantenemos la RAM plana (O(1)) sin importar si son 5 o 50 millones de registros.
+	chunkSize := 10000
+
+	for i := 0; i < len(keys); i += chunkSize {
+		end := i + chunkSize
+		if end > len(keys) {
+			end = len(keys)
+		}
+		chunkKeys := keys[i:end]
+
+		// Mapa temporal pequeño que será recolectado por el GC (Garbage Collector) de Go en cada ciclo
+		chunkItemsToUpdate := make(map[string][]byte, len(chunkKeys))
+		var chunkFailed []string
+
+		for _, key := range chunkKeys {
+			existingValue, found := colStore.Get(key)
+			if !found {
+				chunkFailed = append(chunkFailed, key)
+				continue
+			}
+
+			updatedValue, err := applyBSONPatchFast(existingValue, patchData, now)
+			if err != nil {
+				chunkFailed = append(chunkFailed, key)
+				continue
+			}
+			chunkItemsToUpdate[key] = updatedValue
 		}
 
-		updatedValue, err := applyBSONPatchFast(existingValue, patchData, now)
-		if err != nil {
-			failedKeys = append(failedKeys, key)
-			continue
+		// Enviamos el lote al disco (El WriteBatcher lo asimilará eficientemente)
+		if len(chunkItemsToUpdate) > 0 {
+			updatedCount, diskFailedKeys := colStore.UpdateMany(chunkItemsToUpdate)
+			totalUpdated += updatedCount
+			failedKeys = append(failedKeys, diskFailedKeys...)
 		}
-		itemsToUpdate[key] = updatedValue
+		failedKeys = append(failedKeys, chunkFailed...)
 	}
 
-	updatedCount := 0
-	if len(itemsToUpdate) > 0 {
-		var diskFailedKeys []string
-		updatedCount, diskFailedKeys = colStore.UpdateMany(itemsToUpdate)
-		failedKeys = append(failedKeys, diskFailedKeys...)
-	}
-
-	msg := fmt.Sprintf("OK: %d items updated. %d failed.", updatedCount, len(failedKeys))
+	msg := fmt.Sprintf("OK: %d items updated. %d failed.", totalUpdated, len(failedKeys))
 	protocol.WriteResponse(conn, protocol.StatusOk, msg, nil)
 }
 
-// HandleCollectionDeleteWhere processes the CmdCollectionDeleteWhere command natively.
+// HandleCollectionDeleteWhere processes the CmdCollectionDeleteWhere command natively with Streaming Deletions.
 func (h *ConnectionHandler) HandleCollectionDeleteWhere(r io.Reader, conn net.Conn) {
 	collectionName, queryBSON, err := protocol.ReadCollectionDeleteWhereCommand(r)
 	if err != nil || collectionName == "" {
@@ -571,7 +588,7 @@ func (h *ConnectionHandler) HandleCollectionDeleteWhere(r io.Reader, conn net.Co
 		return
 	}
 
-	// 🔥 USAMOS EL FAST-PATH ZERO-ALLOCATION
+	// Extraemos solo las llaves (strings)
 	keys, err := h.executeQueryForKeys(collectionName, query)
 	if err != nil {
 		protocol.WriteResponse(conn, protocol.StatusError, "Failed to execute query", nil)
@@ -592,9 +609,22 @@ func (h *ConnectionHandler) HandleCollectionDeleteWhere(r io.Reader, conn net.Co
 		return
 	}
 
-	// Enviamos el array nativo directamente a la capa de disco
 	colStore := h.CollectionManager.GetCollection(collectionName)
-	colStore.DeleteMany(keys)
+
+	// 🚀 FAST PATH: Streaming Deletions (Borrado por Lotes)
+	// Evita que bbolt intente rebalancear su árbol B con un commit masivo que congele la DB.
+	chunkSize := 20000 // Los borrados son más ligeros, podemos usar un bloque mayor
+
+	for i := 0; i < len(keys); i += chunkSize {
+		end := i + chunkSize
+		if end > len(keys) {
+			end = len(keys)
+		}
+
+		chunkKeys := keys[i:end]
+		// Enviamos el lote al disco
+		colStore.DeleteMany(chunkKeys)
+	}
 
 	protocol.WriteResponse(conn, protocol.StatusOk, fmt.Sprintf("OK: %d items deleted.", len(keys)), nil)
 }
