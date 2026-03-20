@@ -1,8 +1,11 @@
 package store
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -18,22 +21,66 @@ var GlobalBatchers []*WriteBatcher
 // TotalShards guarda la cantidad total de particiones configuradas para uso global.
 var TotalShards int
 
-// InitDiskEngine inicializa las múltiples bases de datos bbolt y sus Batchers correspondientes.
-func InitDiskEngine(basePath string, numShards int) error {
-	slog.Info("Initializing Disk Engine (Sharded bbolt)...", "basePath", basePath, "shards", numShards)
+// EngineMetadata almacena la configuración estática inmutable del motor.
+type EngineMetadata struct {
+	NumShards int       `json:"num_shards"`
+	CreatedAt time.Time `json:"created_at"`
+}
 
-	if numShards <= 0 {
-		numShards = 1 // Protección básica para asegurar al menos una partición
+// InitDiskEngine inicializa las múltiples bases de datos bbolt y sus Batchers correspondientes,
+// garantizando que el número de particiones sea inmutable tras el primer arranque.
+func InitDiskEngine(basePath string, requestedShards int) error {
+	slog.Info("Initializing Disk Engine (Sharded bbolt)...", "basePath", basePath)
+
+	if requestedShards <= 0 {
+		requestedShards = 1 // Protección básica
 	}
 
-	TotalShards = numShards
-	GlobalDBs = make([]*bbolt.DB, numShards)
-	GlobalBatchers = make([]*WriteBatcher, numShards)
+	// 1. GESTIÓN DE METADATOS INMUTABLES
+	dirPath := filepath.Dir(basePath)
+	metaPath := filepath.Join(dirPath, "system_metadata.json")
+
+	metaBytes, err := os.ReadFile(metaPath)
+	if err == nil {
+		// El archivo existe, este es un arranque secundario.
+		var meta EngineMetadata
+		if err := json.Unmarshal(metaBytes, &meta); err != nil {
+			return fmt.Errorf("CRITICAL: Failed to parse system_metadata.json: %w", err)
+		}
+
+		if meta.NumShards != requestedShards {
+			return fmt.Errorf(
+				"CRITICAL FATAL ERROR: Configured NumShards (%d) does not match the immutable static value (%d) recorded in system_metadata.json. "+
+					"Changing the number of shards on an existing database will cause irreparable data corruption. Boot aborted.",
+				requestedShards, meta.NumShards,
+			)
+		}
+		slog.Info("Verified immutable sharding configuration", "shards", meta.NumShards)
+		TotalShards = meta.NumShards
+	} else if os.IsNotExist(err) {
+		// Primera vez que arranca. Escribimos la configuración en piedra.
+		slog.Info("First boot detected. Creating immutable sharding configuration...", "shards", requestedShards)
+		meta := EngineMetadata{
+			NumShards: requestedShards,
+			CreatedAt: time.Now().UTC(),
+		}
+		newMetaBytes, _ := json.MarshalIndent(meta, "", "  ")
+		if writeErr := os.WriteFile(metaPath, newMetaBytes, 0644); writeErr != nil {
+			return fmt.Errorf("CRITICAL: Failed to save system_metadata.json: %w", writeErr)
+		}
+		TotalShards = requestedShards
+	} else {
+		return fmt.Errorf("CRITICAL: Error accessing system_metadata.json: %w", err)
+	}
+
+	// 2. INICIALIZACIÓN DE LOS SHARDS (El resto de la función se mantiene igual)
+	GlobalDBs = make([]*bbolt.DB, TotalShards)
+	GlobalBatchers = make([]*WriteBatcher, TotalShards)
 
 	// basePath normalmente es "data/luna.db". Lo separamos para añadir el sufijo de la partición.
 	baseName := strings.TrimSuffix(basePath, ".db")
 
-	for i := 0; i < numShards; i++ {
+	for i := 0; i < TotalShards; i++ {
 		dbPath := fmt.Sprintf("%s_%d.db", baseName, i)
 		db, err := bbolt.Open(dbPath, 0600, &bbolt.Options{
 			Timeout: 5 * time.Second,
@@ -47,7 +94,7 @@ func InitDiskEngine(basePath string, numShards int) error {
 
 		GlobalDBs[i] = db
 
-		// Inicializamos un Group Commit Worker EXCLUSIVO para este shard, pasándole su BD específica
+		// Inicializamos un Group Commit Worker EXCLUSIVO para este shard
 		batcher := NewWriteBatcher(db)
 		GlobalBatchers[i] = batcher
 		batcher.Start()
@@ -69,7 +116,7 @@ func CloseDiskEngine() error {
 		// 2. Cerramos la conexión al archivo físico
 		if GlobalDBs[i] != nil {
 			if err := GlobalDBs[i].Close(); err != nil && firstErr == nil {
-				firstErr = err // Guardamos el primer error para reportarlo, pero seguimos cerrando el resto
+				firstErr = err
 			}
 		}
 	}
