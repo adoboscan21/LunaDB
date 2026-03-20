@@ -124,7 +124,7 @@ func NewWriteBatcher(db *bbolt.DB) *WriteBatcher {
 func (wb *WriteBatcher) Start() {
 	go func() {
 		var batch []*BatchOp
-		const maxBatch = 10000
+		const maxBatch = 50000
 
 		var timeoutCh <-chan time.Time
 		var timer *time.Timer
@@ -169,15 +169,20 @@ func (wb *WriteBatcher) Start() {
 }
 
 // commitBatch ejecuta una sola transacción en disco para múltiples operaciones.
-// OPTIMIZACIÓN: Agrupa todas las escrituras por Bucket para maximizar la localidad de caché del SO.
+// GARANTÍA ACID: Ningún cliente recibe respuesta hasta que el disco confirme el fsync físico.
 func (wb *WriteBatcher) commitBatch(batch []*BatchOp) {
+	// Diccionario para almacenar errores lógicos/validación (ej. llave duplicada)
+	// y evitar que un error individual aborte todo el batch masivo.
+	validationErrors := make(map[*BatchOp]error)
+
+	// Inicia la transacción bloqueante en bbolt
 	err := wb.db.Update(func(tx *bbolt.Tx) error {
 		// Agrupador masivo de escrituras validadas
 		groupedWrites := make(map[string][]TxWrite)
 
 		for _, op := range batch {
 			if op.IsTx {
-				// 1. VALIDACIÓN ULTRA RÁPIDA (Dentro del cerrojo de bbolt)
+				// 1. VALIDACIÓN ULTRA RÁPIDA
 				var txErr error
 				for _, write := range op.TxWrites {
 					b, err := tx.CreateBucketIfNotExists(write.Collection)
@@ -198,35 +203,31 @@ func (wb *WriteBatcher) commitBatch(batch []*BatchOp) {
 				}
 
 				if txErr != nil {
-					op.Done <- txErr
+					validationErrors[op] = txErr
 					continue
 				}
 
-				// 2. Si es válida, agrupamos sus escrituras lógicamente
+				// 2. Agrupamos sus escrituras lógicamente (NO avisamos al cliente aún)
 				for _, write := range op.TxWrites {
 					colStr := string(write.Collection)
 					groupedWrites[colStr] = append(groupedWrites[colStr], write)
 				}
-				op.Done <- nil // Transacción validada y encolada
 
 			} else {
 				// Lógica de Operación Simple
 				_, err := tx.CreateBucketIfNotExists(op.Collection)
 				if err != nil {
-					op.Done <- err
+					validationErrors[op] = err
 					continue
 				}
 				colStr := string(op.Collection)
 				groupedWrites[colStr] = append(groupedWrites[colStr], TxWrite{
 					Collection: op.Collection, Key: op.Key, Value: op.Value, IsDelete: op.IsDelete,
 				})
-				op.Done <- nil
 			}
 		}
 
-		// 3. MUTACIÓN EN DISCO AGRUPADA POR BUCKET (El secreto de la velocidad)
-		// Al hacer esto, bbolt carga la página de disco del índice una sola vez,
-		// inserta miles de llaves y luego pasa al siguiente índice.
+		// 3. MUTACIÓN EN DISCO AGRUPADA POR BUCKET
 		for bucketName, writes := range groupedWrites {
 			b := tx.Bucket([]byte(bucketName))
 			for _, write := range writes {
@@ -237,15 +238,22 @@ func (wb *WriteBatcher) commitBatch(batch []*BatchOp) {
 				}
 			}
 		}
+
+		// bbolt hará el fsync FÍSICO al disco duro al retornar nil de esta función.
 		return nil
 	})
 
-	if err != nil {
-		for _, op := range batch {
-			select {
-			case op.Done <- err:
-			default:
-			}
+	// 4. RESOLUCIÓN DE DURABILIDAD (TRUE ACID)
+	// Solo llegamos aquí si la luz NO se cortó y el disco duro confirmó la escritura.
+	// Ahora sí, liberamos a todos los clientes bloqueados.
+	for _, op := range batch {
+		if valErr, hasErr := validationErrors[op]; hasErr {
+			// El cliente falló por lógica (ej. clave duplicada)
+			op.Done <- valErr
+		} else {
+			// El cliente recibe err (nil si el batch guardó exitosamente,
+			// o un error catastrófico de disco duro si falló el I/O)
+			op.Done <- err
 		}
 	}
 }
