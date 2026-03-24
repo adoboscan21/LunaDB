@@ -238,11 +238,17 @@ func ReadCommandType(r io.Reader) (CommandType, error) {
 	return CommandType(buf[0]), nil
 }
 
-// ReadString reads a length-prefixed string from the connection.
+const MaxStringLen = 32 * 1024 * 1024 // 32 MB
+const MaxBytesLen = 64 * 1024 * 1024  // 64 MB
+
+// ReadString reads a length-prefixed string from the connection safely.
 func ReadString(r io.Reader) (string, error) {
 	var strLen uint32
 	if err := binary.Read(r, ByteOrder, &strLen); err != nil {
 		return "", fmt.Errorf("failed to read string length: %w", err)
+	}
+	if strLen > MaxStringLen {
+		return "", fmt.Errorf("string length exceeds maximum allowed limit (%d bytes)", MaxStringLen)
 	}
 	strBytes := make([]byte, strLen)
 	if _, err := io.ReadFull(r, strBytes); err != nil {
@@ -262,11 +268,14 @@ func WriteString(w io.Writer, s string) error {
 	return nil
 }
 
-// ReadBytes reads length-prefixed bytes from the connection.
+// ReadBytes reads length-prefixed bytes from the connection safely.
 func ReadBytes(r io.Reader) ([]byte, error) {
 	var byteLen uint32
 	if err := binary.Read(r, ByteOrder, &byteLen); err != nil {
 		return nil, fmt.Errorf("failed to read bytes length: %w", err)
+	}
+	if byteLen > MaxBytesLen {
+		return nil, fmt.Errorf("payload length exceeds maximum allowed limit (%d bytes)", MaxBytesLen)
 	}
 	byteData := make([]byte, byteLen)
 	if _, err := io.ReadFull(r, byteData); err != nil {

@@ -206,6 +206,17 @@ func (wb *WriteBatcher) Start() {
 				if timer != nil {
 					timer.Stop()
 				}
+
+				for {
+					select {
+					case op := <-wb.ops:
+						batch = append(batch, op)
+					default:
+						goto FlushBatch
+					}
+				}
+
+			FlushBatch:
 				if len(batch) > 0 {
 					wb.commitBatch(batch)
 				}

@@ -202,15 +202,34 @@ func (tm *TransactionManager) Commit(txID string) error {
 
 					enrichedValue, _ := bson.Marshal(data)
 
-					// Estructura persistente final
-					rec := ItemRecord{Value: enrichedValue, CreatedAt: now}
-					recBytes, _ := bson.Marshal(rec)
+					// === INTEGRACIÓN DE VERSIÓN (MVCC) ===
+					var newVersion uint64 = 1
+					if oldVal != nil {
+						// Recuperamos rápidamente la versión vieja del disco para incrementarla
+						b := dbTx.Bucket([]byte(op.Collection))
+						if b != nil {
+							if existingBytes := b.Get([]byte(op.Key)); existingBytes != nil {
+								var tempRec ItemRecord
+								if bson.Unmarshal(existingBytes, &tempRec) == nil {
+									newVersion = tempRec.Version + 1
+								}
+							}
+						}
+					}
+
+					// Estructura persistente final (ahora incluye Version)
+					newRec := ItemRecord{
+						Value:     enrichedValue,
+						CreatedAt: now,
+						Version:   newVersion,
+					}
+					recBytes, _ := bson.Marshal(newRec)
 
 					// Escribir documento principal
 					localTxWrites = append(localTxWrites, TxWrite{
 						Collection:   []byte(op.Collection),
 						Key:          []byte(op.Key),
-						Value:        recBytes,
+						Value:        recBytes, // Usamos la nueva estructura serializada
 						IsDelete:     false,
 						MustExist:    op.OpType == OpTypeUpdate,
 						MustNotExist: op.OpType == OpTypeSet,

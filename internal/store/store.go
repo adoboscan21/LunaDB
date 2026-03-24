@@ -9,6 +9,7 @@ import (
 type ItemRecord struct {
 	Value     []byte    `bson:"v"`
 	CreatedAt time.Time `bson:"c"`
+	Version   uint64    `bson:"ver"`
 }
 
 type DataStore interface {

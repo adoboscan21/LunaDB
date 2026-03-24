@@ -112,7 +112,7 @@ func (h *ConnectionHandler) HandleRestore(r io.Reader, conn net.Conn) {
 		}
 	}
 
-	backupName, err := protocol.ReadRestoreCommand(r)
+	rawBackupName, err := protocol.ReadRestoreCommand(r)
 	if err != nil {
 		slog.Error("Failed to read RESTORE command payload", "remote_addr", remoteAddr, "error", err)
 		if conn != nil {
@@ -120,9 +120,13 @@ func (h *ConnectionHandler) HandleRestore(r io.Reader, conn net.Conn) {
 		}
 		return
 	}
-	if backupName == "" {
+
+	// Sanitización estricta: Extraer solo el nombre final del directorio
+	backupName := filepath.Base(filepath.Clean(rawBackupName))
+
+	if backupName == "" || backupName == "." || backupName == "/" || backupName == "\\" {
 		if conn != nil {
-			protocol.WriteResponse(conn, protocol.StatusBadRequest, "Backup name cannot be empty.", nil)
+			protocol.WriteResponse(conn, protocol.StatusBadRequest, "Invalid or empty backup name.", nil)
 		}
 		return
 	}
