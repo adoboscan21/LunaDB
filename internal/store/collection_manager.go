@@ -178,3 +178,11 @@ func (cm *CollectionManager) InitializeFromDisk() error {
 func (cm *CollectionManager) Wait()                                                {}
 func (cm *CollectionManager) EnqueueSaveTask(collectionName string, col DataStore) {}
 func (cm *CollectionManager) EnqueueDeleteTask(collectionName string)              {}
+
+// ClearMemory purga el caché de colecciones en RAM sin tocar los discos físicos.
+// Útil durante restauraciones masivas donde los discos cambian por debajo.
+func (cm *CollectionManager) ClearMemory() {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.collections = make(map[string]DataStore)
+}

@@ -11,12 +11,11 @@ import (
 type Config struct {
 	Port                 string
 	ShutdownTimeout      time.Duration
-	BackupInterval       time.Duration
-	BackupRetention      time.Duration
 	WorkerPoolSize       int
 	NumShards            int
 	DefaultRootPassword  string
 	DefaultAdminPassword string
+	RestoreFile          string
 }
 
 // NewDefaultConfig creates a Config struct with sensible default values.
@@ -24,8 +23,6 @@ func NewDefaultConfig() Config {
 	return Config{
 		Port:                 ":5876",
 		ShutdownTimeout:      10 * time.Second,
-		BackupInterval:       1 * time.Hour,
-		BackupRetention:      7 * 24 * time.Hour,
 		WorkerPoolSize:       100,
 		NumShards:            16,
 		DefaultRootPassword:  "rootpass",
@@ -68,9 +65,12 @@ func applyEnvConfig(cfg *Config) {
 		}
 	}
 
+	if restoreEnv := os.Getenv("LUNADB_RESTORE_FILE"); restoreEnv != "" {
+		cfg.RestoreFile = restoreEnv
+		slog.Info("Boot-time restore file configured", "file", restoreEnv)
+	}
+
 	overrideDuration("LUNADB_SHUTDOWN_TIMEOUT", &cfg.ShutdownTimeout)
-	overrideDuration("LUNADB_BACKUP_INTERVAL", &cfg.BackupInterval)
-	overrideDuration("LUNADB_BACKUP_RETENTION", &cfg.BackupRetention)
 }
 
 func overrideDuration(envKey string, target *time.Duration) {
