@@ -73,6 +73,15 @@ func (h *ConnectionHandler) handleCollectionQuery(r io.Reader, conn net.Conn) {
 		query.Limit = &maxLimit
 	}
 
+	isAggregationOrCount := len(query.Aggregations) > 0 || len(query.GroupBy) > 0 || query.Count || query.Distinct != ""
+
+	if len(query.OrderBy) == 0 && !isAggregationOrCount {
+		query.OrderBy = []OrderByClause{
+			{Field: globalconst.ID, Direction: globalconst.SortAsc},
+		}
+		slog.Debug("Injected default ORDER BY _id for deterministic pagination")
+	}
+
 	slog.Debug("Processing collection query", "user", h.AuthenticatedUser, "collection", collectionName)
 
 	results, err := h.processCollectionQuery(collectionName, query)
@@ -202,66 +211,77 @@ func (h *ConnectionHandler) processCollectionQuery(collectionName string, query 
 		isDesc := query.OrderBy[0].Direction == globalconst.SortDesc
 
 		if colStore.HasIndex(orderField) {
-			limit := -1
-			if query.Limit != nil {
-				limit = *query.Limit
-			}
-			offset := query.Offset
-			matchCount := 0
-			seenKeys := make(map[string]struct{})
+			// Evaluador de Costos (NUEVO COST-BASED OPTIMIZER PARA EVITAR FULL-SCANS LENTOS)
+			filterCost := h.estimateFilterCardinality(colStore, query.Filter)
+			maxInt := int(^uint(0) >> 1)
 
-			if len(query.Filter) == 0 {
-				colStore.StreamByIndex(orderField, isDesc, func(key string) bool {
-					if _, seen := seenKeys[key]; seen {
-						return true
-					}
-					seenKeys[key] = struct{}{}
-
-					matchCount++
-					if matchCount > offset {
-						if vBytes, found := colStore.Get(key); found {
-							paginatedRaw = append(paginatedRaw, bson.Raw(vBytes))
-							if limit != -1 && len(paginatedRaw) >= limit {
-								return false // Cortocircuito absoluto
-							}
-						}
-					}
-					return true
-				})
-				if limit != -1 && len(paginatedRaw) == limit {
-					usedFastPath = true
-					slog.Debug("Query optimizer: used B-Tree Fast Path for DEEP PAGINATION")
-				} else if limit == -1 {
-					usedFastPath = true
+			// Si el filtro arroja pocos resultados (< 5000), ES MÁS RÁPIDO obtenerlos todos
+			// mediante el índice del filtro y ordenarlos en memoria RAM que escanear secuencialmente
+			// todo el árbol del ORDER BY buscando coincidencias (Full Index Scan encubierto).
+			if filterCost > 5000 || filterCost == maxInt || len(query.Filter) == 0 {
+				limit := -1
+				if query.Limit != nil {
+					limit = *query.Limit
 				}
-			} else {
-				compiledEvaluator := h.compileFilter(query.Filter)
-				colStore.StreamByIndex(orderField, isDesc, func(key string) bool {
-					if _, seen := seenKeys[key]; seen {
-						return true
-					}
-					seenKeys[key] = struct{}{}
+				offset := query.Offset
+				matchCount := 0
+				seenKeys := make(map[string]struct{})
 
-					if vBytes, found := colStore.Get(key); found {
-						rawDoc := bson.Raw(vBytes)
-						if compiledEvaluator(rawDoc) {
-							matchCount++
-							if matchCount > offset {
-								paginatedRaw = append(paginatedRaw, rawDoc)
+				if len(query.Filter) == 0 {
+					colStore.StreamByIndex(orderField, isDesc, func(key string) bool {
+						if _, seen := seenKeys[key]; seen {
+							return true
+						}
+						seenKeys[key] = struct{}{}
+
+						matchCount++
+						if matchCount > offset {
+							if vBytes, found := colStore.Get(key); found {
+								paginatedRaw = append(paginatedRaw, bson.Raw(vBytes))
 								if limit != -1 && len(paginatedRaw) >= limit {
-									return false
+									return false // Cortocircuito absoluto
 								}
 							}
 						}
+						return true
+					})
+					if limit != -1 && len(paginatedRaw) == limit {
+						usedFastPath = true
+						slog.Debug("Query optimizer: used B-Tree Fast Path for DEEP PAGINATION")
+					} else if limit == -1 {
+						usedFastPath = true
 					}
-					return true
-				})
-				if limit != -1 && len(paginatedRaw) == limit {
-					usedFastPath = true
-					slog.Debug("Query optimizer: used B-Tree Fast Path for ORDER BY + LIMIT + FILTER")
 				} else {
-					paginatedRaw = nil
+					compiledEvaluator := h.compileFilter(query.Filter)
+					colStore.StreamByIndex(orderField, isDesc, func(key string) bool {
+						if _, seen := seenKeys[key]; seen {
+							return true
+						}
+						seenKeys[key] = struct{}{}
+
+						if vBytes, found := colStore.Get(key); found {
+							rawDoc := bson.Raw(vBytes)
+							if compiledEvaluator(rawDoc) {
+								matchCount++
+								if matchCount > offset {
+									paginatedRaw = append(paginatedRaw, rawDoc)
+									if limit != -1 && len(paginatedRaw) >= limit {
+										return false
+									}
+								}
+							}
+						}
+						return true
+					})
+					if limit != -1 && len(paginatedRaw) == limit {
+						usedFastPath = true
+						slog.Debug("Query optimizer: used B-Tree Fast Path for ORDER BY + LIMIT + FILTER")
+					} else {
+						paginatedRaw = nil
+					}
 				}
+			} else {
+				slog.Debug("Query Planner: Filter is highly selective. Overriding OrderBy Fast Path for RAM Sort.", "cost", filterCost)
 			}
 		}
 	}
@@ -522,6 +542,8 @@ func (h *ConnectionHandler) processCollectionQuery(collectionName string, query 
 			for id := range neededForeignKeysMap {
 				foreignIds = append(foreignIds, id)
 			}
+
+			// NOTA: Esta llamada ahora invoca el GetMany paralelizado.
 			foreignDocsBytes := foreignColStore.GetMany(foreignIds)
 
 			// 3. Fase Probe: Ensamblar los documentos O(1)

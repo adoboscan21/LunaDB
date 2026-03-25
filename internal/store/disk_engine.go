@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"go.etcd.io/bbolt"
+	"go.mongodb.org/mongo-driver/bson"
 )
 
 // GlobalDBs almacena las conexiones a cada una de las particiones (shards) físicas.
@@ -129,12 +130,14 @@ func CloseDiskEngine() error {
 
 // TxWrite define una operación atómica dentro de una transacción
 type TxWrite struct {
-	Collection   []byte
-	Key          []byte
-	Value        []byte
-	IsDelete     bool
-	MustExist    bool // Validación rápida Anti-Race Condition
-	MustNotExist bool
+	Collection      []byte
+	Key             []byte
+	Value           []byte
+	IsDelete        bool
+	MustExist       bool // Validación rápida Anti-Race Condition
+	MustNotExist    bool
+	ExpectedVersion uint64 // Añadido: Para Optimistic Concurrency Control (OCC)
+	CheckVersion    bool   // Añadido: Para activar la verificación MVCC
 }
 
 type BatchOp struct {
@@ -189,7 +192,13 @@ func (wb *WriteBatcher) Start() {
 
 				// Si el lote se llenó a tope, escribimos ya mismo sin esperar los 5ms
 				if len(batch) >= maxBatch {
-					timer.Stop()    // Apagamos el reloj
+					// Drenar el canal canónicamente para evitar Memory Leaks fantasmas
+					if timer != nil && !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
 					timeoutCh = nil // Desactivamos el canal del select
 
 					wb.commitBatch(batch)
@@ -240,7 +249,7 @@ func (wb *WriteBatcher) commitBatch(batch []*BatchOp) {
 
 		for _, op := range batch {
 			if op.IsTx {
-				// 1. VALIDACIÓN ULTRA RÁPIDA
+				// 1. VALIDACIÓN ULTRA RÁPIDA Y OCC (Optimistic Concurrency Control)
 				var txErr error
 				for _, write := range op.TxWrites {
 					b, err := tx.CreateBucketIfNotExists(write.Collection)
@@ -249,7 +258,9 @@ func (wb *WriteBatcher) commitBatch(batch []*BatchOp) {
 						break
 					}
 
-					exists := b.Get(write.Key) != nil
+					existingBytes := b.Get(write.Key)
+					exists := existingBytes != nil
+
 					if write.MustNotExist && exists {
 						txErr = fmt.Errorf("transaction aborted: key conflict on '%s'", write.Key)
 						break
@@ -257,6 +268,17 @@ func (wb *WriteBatcher) commitBatch(batch []*BatchOp) {
 					if write.MustExist && !exists {
 						txErr = fmt.Errorf("transaction aborted: key missing '%s'", write.Key)
 						break
+					}
+
+					// Verificación de MVCC para evitar sobreescritura fantasma (TOC-TOU)
+					if write.CheckVersion && exists {
+						var tempRec ItemRecord
+						if bson.Unmarshal(existingBytes, &tempRec) == nil {
+							if tempRec.Version != write.ExpectedVersion {
+								txErr = fmt.Errorf("transaction aborted: MVCC conflict on '%s'. Expected ver %d, got %d", write.Key, write.ExpectedVersion, tempRec.Version)
+								break
+							}
+						}
 					}
 				}
 
@@ -302,15 +324,12 @@ func (wb *WriteBatcher) commitBatch(batch []*BatchOp) {
 	})
 
 	// 4. RESOLUCIÓN DE DURABILIDAD (TRUE ACID)
-	// Solo llegamos aquí si la luz NO se cortó y el disco duro confirmó la escritura.
-	// Ahora sí, liberamos a todos los clientes bloqueados.
 	for _, op := range batch {
 		if valErr, hasErr := validationErrors[op]; hasErr {
-			// El cliente falló por lógica (ej. clave duplicada)
+			// El cliente falló por lógica (ej. clave duplicada o error MVCC)
 			op.Done <- valErr
 		} else {
-			// El cliente recibe err (nil si el batch guardó exitosamente,
-			// o un error catastrófico de disco duro si falló el I/O)
+			// El cliente recibe err (nil si el batch guardó exitosamente, o un error fatal de I/O)
 			op.Done <- err
 		}
 	}

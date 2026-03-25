@@ -202,22 +202,26 @@ func (tm *TransactionManager) Commit(txID string) error {
 
 					enrichedValue, _ := bson.Marshal(data)
 
-					// === INTEGRACIÓN DE VERSIÓN (MVCC) ===
+					// === INTEGRACIÓN DE VERSIÓN (MVCC) Y LECTURA ESPERADA ===
+					var expectedVersion uint64 = 0
 					var newVersion uint64 = 1
+					var checkVersion bool = false
+
 					if oldVal != nil {
-						// Recuperamos rápidamente la versión vieja del disco para incrementarla
 						b := dbTx.Bucket([]byte(op.Collection))
 						if b != nil {
 							if existingBytes := b.Get([]byte(op.Key)); existingBytes != nil {
 								var tempRec ItemRecord
 								if bson.Unmarshal(existingBytes, &tempRec) == nil {
+									expectedVersion = tempRec.Version
 									newVersion = tempRec.Version + 1
+									checkVersion = true
 								}
 							}
 						}
 					}
 
-					// Estructura persistente final (ahora incluye Version)
+					// Estructura persistente final
 					newRec := ItemRecord{
 						Value:     enrichedValue,
 						CreatedAt: now,
@@ -227,12 +231,14 @@ func (tm *TransactionManager) Commit(txID string) error {
 
 					// Escribir documento principal
 					localTxWrites = append(localTxWrites, TxWrite{
-						Collection:   []byte(op.Collection),
-						Key:          []byte(op.Key),
-						Value:        recBytes, // Usamos la nueva estructura serializada
-						IsDelete:     false,
-						MustExist:    op.OpType == OpTypeUpdate,
-						MustNotExist: op.OpType == OpTypeSet,
+						Collection:      []byte(op.Collection),
+						Key:             []byte(op.Key),
+						Value:           recBytes,
+						IsDelete:        false,
+						MustExist:       op.OpType == OpTypeUpdate,
+						MustNotExist:    op.OpType == OpTypeSet,
+						ExpectedVersion: expectedVersion, // Registramos la versión
+						CheckVersion:    checkVersion,    // Encendemos la verificación
 					})
 
 					// === GESTIÓN DE ÍNDICES ===
@@ -271,12 +277,30 @@ func (tm *TransactionManager) Commit(txID string) error {
 					}
 
 				} else {
-					// OpTypeDelete
+					// OpTypeDelete: Recuperar la versión esperada para el borrado seguro
+					var expectedVersion uint64 = 0
+					var checkVersion bool = false
+
+					if oldVal != nil {
+						b := dbTx.Bucket([]byte(op.Collection))
+						if b != nil {
+							if existingBytes := b.Get([]byte(op.Key)); existingBytes != nil {
+								var tempRec ItemRecord
+								if bson.Unmarshal(existingBytes, &tempRec) == nil {
+									expectedVersion = tempRec.Version
+									checkVersion = true
+								}
+							}
+						}
+					}
+
 					localTxWrites = append(localTxWrites, TxWrite{
-						Collection: []byte(op.Collection),
-						Key:        []byte(op.Key),
-						IsDelete:   true,
-						MustExist:  true,
+						Collection:      []byte(op.Collection),
+						Key:             []byte(op.Key),
+						IsDelete:        true,
+						MustExist:       true,
+						ExpectedVersion: expectedVersion, // Registramos la versión
+						CheckVersion:    checkVersion,    // Encendemos la verificación
 					})
 
 					// === BORRADO DE ÍNDICES ===
@@ -309,7 +333,6 @@ func (tm *TransactionManager) Commit(txID string) error {
 	}
 
 	// --- FASE 2: DELEGACIÓN PARALELA A LOS WRITE BATCHERS ---
-	// Declaramos el tipo ANTES de usarlo en el make()
 	type channelResult struct {
 		shardID int
 		err     error
@@ -334,7 +357,6 @@ func (tm *TransactionManager) Commit(txID string) error {
 	}
 
 	if commitErr != nil {
-		// En un sistema altamente distribuido, un fallo aquí requeriría recuperación por WAL.
 		tm.Rollback(txID)
 		return commitErr
 	}

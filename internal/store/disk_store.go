@@ -113,10 +113,11 @@ func (s *DiskStore) SetMany(items map[string][]byte) (int, int) {
 						continue
 					}
 
-					// Serialización optimizada con bson.D (Sin reflexión de mapas)
+					// Serialización optimizada con bson.D conservando la Versión
 					recordBytes, _ := bson.Marshal(bson.D{
 						{Key: "v", Value: value},
 						{Key: "c", Value: now},
+						{Key: "ver", Value: uint64(1)}, // Asignamos la primera versión
 					})
 					b.Put([]byte(key), recordBytes)
 
@@ -270,38 +271,59 @@ func (s *DiskStore) Get(key string) ([]byte, bool) {
 	return valCopy, found
 }
 
-// GetMany recupera múltiples ítems agrupando las consultas por partición.
+// GetMany recupera múltiples ítems agrupando las consultas y ejecutándolas concurrentemente por partición.
 func (s *DiskStore) GetMany(keys []string) map[string][]byte {
 	res := make(map[string][]byte, len(keys))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
 
+	// Enrutamiento de llaves a su Shard correspondiente
 	shardKeys := make(map[int][]string)
 	for _, key := range keys {
 		shardID := GetShardID(key, TotalShards)
 		shardKeys[shardID] = append(shardKeys[shardID], key)
 	}
 
+	// Consultar los Shards en paralelo en lugar de secuencialmente
 	for shardID, sKeys := range shardKeys {
-		db := GlobalDBs[shardID]
-		db.View(func(tx *bbolt.Tx) error {
-			b := tx.Bucket(s.collectionName)
-			if b == nil {
-				return nil
-			}
-			for _, k := range sKeys {
-				if recordBytes := b.Get([]byte(k)); recordBytes != nil {
-					raw := bson.Raw(recordBytes)
-					if val := raw.Lookup("v"); val.Type == bsontype.Binary {
-						_, data := val.Binary()
-						valCopy := make([]byte, len(data))
-						copy(valCopy, data)
-						res[k] = valCopy
+		wg.Add(1)
+		go func(sID int, keysToFetch []string) {
+			defer wg.Done()
+			db := GlobalDBs[sID]
+			localRes := make(map[string][]byte)
+
+			db.View(func(tx *bbolt.Tx) error {
+				b := tx.Bucket(s.collectionName)
+				if b == nil {
+					return nil
+				}
+				for _, k := range keysToFetch {
+					if recordBytes := b.Get([]byte(k)); recordBytes != nil {
+						raw := bson.Raw(recordBytes)
+						if val := raw.Lookup("v"); val.Type == bsontype.Binary {
+							_, data := val.Binary()
+							// Copia segura de la memoria mmap de bbolt
+							valCopy := make([]byte, len(data))
+							copy(valCopy, data)
+							localRes[k] = valCopy
+						}
 					}
 				}
+				return nil
+			})
+
+			// Volcar resultados locales al mapa general de forma segura
+			if len(localRes) > 0 {
+				mu.Lock()
+				for k, v := range localRes {
+					res[k] = v
+				}
+				mu.Unlock()
 			}
-			return nil
-		})
+		}(shardID, sKeys)
 	}
 
+	wg.Wait()
 	return res
 }
 
@@ -399,7 +421,12 @@ func (s *DiskStore) UpdateMany(items map[string][]byte) (int, []string) {
 					var oldRecord ItemRecord
 					bson.Unmarshal(existing, &oldRecord)
 
-					recordBytes, _ := bson.Marshal(ItemRecord{Value: newValue, CreatedAt: oldRecord.CreatedAt})
+					// Incrementamos la versión cuidando el control de MVCC
+					recordBytes, _ := bson.Marshal(ItemRecord{
+						Value:     newValue,
+						CreatedAt: oldRecord.CreatedAt,
+						Version:   oldRecord.Version + 1, // Incrementamos la versión anterior
+					})
 
 					if err := b.Put(keyBytes, recordBytes); err == nil {
 						localUpdated++
@@ -582,43 +609,145 @@ func (s *DiskStore) LookupRange(field string, low, high any, lInc, hInc bool) ([
 	return keys, true
 }
 
+type streamItem struct {
+	key []byte
+}
+
+// StreamByIndex itera sobre los índices utilizando un K-Way Merge concurrente para garantizar
+// un ordenamiento global perfecto a través de todas las particiones (Shards).
 func (s *DiskStore) StreamByIndex(field string, desc bool, cb func(key string) bool) bool {
 	if !s.HasIndex(field) {
 		return false
 	}
 
 	idxBucketName := []byte("_idx_" + string(s.collectionName) + "_" + field)
-	keepGoing := true
 
+	// Canales para el K-Way Merge: uno por cada Shard
+	itemsCh := make([]chan streamItem, TotalShards)
+	cancelCh := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// 1. Iniciar lectura concurrente en todos los Shards
 	for i := 0; i < TotalShards; i++ {
-		GlobalDBs[i].View(func(tx *bbolt.Tx) error {
-			b := tx.Bucket(idxBucketName)
-			if b == nil {
-				return nil
-			}
-			c := b.Cursor()
+		itemsCh[i] = make(chan streamItem, 64) // Buffer para pre-carga
+		wg.Add(1)
 
-			if desc {
-				for k, _ := c.Last(); k != nil; k, _ = c.Prev() {
-					if !cb(decodeDocID(k)) {
-						keepGoing = false
-						break
+		go func(shardID int, ch chan streamItem) {
+			defer wg.Done()
+			defer close(ch)
+
+			GlobalDBs[shardID].View(func(tx *bbolt.Tx) error {
+				b := tx.Bucket(idxBucketName)
+				if b == nil {
+					return nil
+				}
+				c := b.Cursor()
+
+				var k []byte
+				if desc {
+					k, _ = c.Last()
+				} else {
+					k, _ = c.First()
+				}
+
+				for k != nil {
+					// Comprobar si el coordinador pidió abortar (ej. se cumplió el LIMIT)
+					select {
+					case <-cancelCh:
+						return nil
+					default:
+					}
+
+					// bbolt recicla la memoria de 'k', debemos copiarla
+					keyCopy := make([]byte, len(k))
+					copy(keyCopy, k)
+
+					// Enviar al coordinador
+					select {
+					case ch <- streamItem{key: keyCopy}:
+					case <-cancelCh:
+						return nil
+					}
+
+					if desc {
+						k, _ = c.Prev()
+					} else {
+						k, _ = c.Next()
 					}
 				}
-			} else {
-				for k, _ := c.First(); k != nil; k, _ = c.Next() {
-					if !cb(decodeDocID(k)) {
-						keepGoing = false
-						break
-					}
-				}
-			}
-			return nil
-		})
-		if !keepGoing {
-			break
+				return nil
+			})
+		}(i, itemsCh[i])
+	}
+
+	// 2. Coordinador K-Way Merge
+	currentItems := make([]*streamItem, TotalShards)
+	activeShards := TotalShards
+
+	// Cargar el primer elemento de cada Shard
+	for i := 0; i < TotalShards; i++ {
+		item, ok := <-itemsCh[i]
+		if ok {
+			currentItems[i] = &item
+		} else {
+			currentItems[i] = nil
+			activeShards--
 		}
 	}
+
+	keepGoing := true
+	for activeShards > 0 && keepGoing {
+		bestIdx := -1
+
+		// Encontrar la llave ganadora entre los Shards activos
+		for i := 0; i < TotalShards; i++ {
+			if currentItems[i] == nil {
+				continue
+			}
+			if bestIdx == -1 {
+				bestIdx = i
+				continue
+			}
+
+			// bytes.Compare funciona perfectamente porque los bytes de índice
+			// de LunaDB están diseñados para ser lexicográficamente correctos.
+			cmp := bytes.Compare(currentItems[i].key, currentItems[bestIdx].key)
+			if desc {
+				if cmp > 0 { // Descendente: buscamos el mayor
+					bestIdx = i
+				}
+			} else {
+				if cmp < 0 { // Ascendente: buscamos el menor
+					bestIdx = i
+				}
+			}
+		}
+
+		if bestIdx == -1 {
+			break
+		}
+
+		// Procesar el elemento ganador
+		docID := decodeDocID(currentItems[bestIdx].key)
+		if !cb(docID) {
+			keepGoing = false
+			break
+		}
+
+		// Extraer el siguiente elemento SOLO del Shard que acaba de ganar
+		item, ok := <-itemsCh[bestIdx]
+		if ok {
+			currentItems[bestIdx] = &item
+		} else {
+			currentItems[bestIdx] = nil
+			activeShards--
+		}
+	}
+
+	// 3. Limpieza y cierre seguro
+	close(cancelCh) // Avisa a las gorutinas que detengan la lectura
+	wg.Wait()       // Espera a que todas las transacciones View se cierren
+
 	return true
 }
 
