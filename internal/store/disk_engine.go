@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"go.etcd.io/bbolt"
-	"go.mongodb.org/mongo-driver/bson"
 )
 
 // GlobalDBs almacena las conexiones a cada una de las particiones (shards) físicas.
@@ -273,7 +272,7 @@ func (wb *WriteBatcher) commitBatch(batch []*BatchOp) {
 					// Verificación de MVCC para evitar sobreescritura fantasma (TOC-TOU)
 					if write.CheckVersion && exists {
 						var tempRec ItemRecord
-						if bson.Unmarshal(existingBytes, &tempRec) == nil {
+						if UnmarshalRecord(existingBytes, &tempRec) == nil {
 							if tempRec.Version != write.ExpectedVersion {
 								txErr = fmt.Errorf("transaction aborted: MVCC conflict on '%s'. Expected ver %d, got %d", write.Key, write.ExpectedVersion, tempRec.Version)
 								break

@@ -114,6 +114,10 @@ func (h *ConnectionHandler) handleCollectionQuery(r io.Reader, conn net.Conn) {
 func (h *ConnectionHandler) processCollectionQuery(collectionName string, query *Query) (any, error) {
 	colStore := h.CollectionManager.GetCollection(collectionName)
 
+	if query.Explain {
+		return h.explainQuery(collectionName, query)
+	}
+
 	// =====================================================================
 	// 🚀 1. OPTIMIZACIÓN LETAL: INDEX-ONLY SCAN (CORTOCIRCUITO ABSOLUTO)
 	// =====================================================================
@@ -2111,3 +2115,152 @@ func (h *ConnectionHandler) executeQueryForKeys(collectionName string, query *Qu
 
 	return matchKeys, nil
 }
+
+// explainQuery genera el plan de ejecución detallado para una consulta.
+func (h *ConnectionHandler) explainQuery(collectionName string, query *Query) (any, error) {
+	colStore := h.CollectionManager.GetCollection(collectionName)
+	startTime := time.Now()
+
+	indexOnlyScan := false
+	scanType := "Full Table Scan (Sequential)"
+	indexUsed := ""
+	filterCost := int(^uint(0) >> 1)
+	usedIndexMerge := false
+
+	// Check 1: Index-Only Scan para Distinct
+	if query.Distinct != "" && len(query.Filter) == 0 {
+		if colStore.HasIndex(query.Distinct) {
+			indexOnlyScan = true
+			scanType = "Index-Only Distinct Scan"
+			indexUsed = query.Distinct
+		}
+	}
+
+	// Check 2: Index-Only Scan para Group By Count
+	if !indexOnlyScan && len(query.GroupBy) == 1 && len(query.Filter) == 0 && len(query.Having) == 0 {
+		isOnlyCount := true
+		for _, agg := range query.Aggregations {
+			if agg.Func != globalconst.AggCount || agg.Field != "*" {
+				isOnlyCount = false
+				break
+			}
+		}
+		if isOnlyCount && len(query.Aggregations) > 0 {
+			if colStore.HasIndex(query.GroupBy[0]) {
+				indexOnlyScan = true
+				scanType = "Index-Only Group-By Scan"
+				indexUsed = query.GroupBy[0]
+			}
+		}
+	}
+
+	// Check 3: Simple Query (sin filtro, orden, agregación, etc.)
+	isSimpleQuery := len(query.Filter) == 0 && len(query.OrderBy) == 0 &&
+		len(query.Aggregations) == 0 && len(query.GroupBy) == 0 &&
+		query.Distinct == "" && len(query.Lookups) == 0 && len(query.Projection) == 0 && !query.Count
+
+	if !indexOnlyScan && isSimpleQuery {
+		scanType = "Full Table Scan (Simple Sequential)"
+	}
+
+	// Check 4: Paginación profunda con B-Tree Fast Path
+	if !indexOnlyScan && !isSimpleQuery && len(query.OrderBy) == 1 && len(query.Aggregations) == 0 && len(query.GroupBy) == 0 && query.Distinct == "" && !query.Count {
+		orderField := query.OrderBy[0].Field
+		if colStore.HasIndex(orderField) {
+			filterCost = h.estimateFilterCardinality(colStore, query.Filter)
+			maxInt := int(^uint(0) >> 1)
+			if filterCost > 5000 || filterCost == maxInt || len(query.Filter) == 0 {
+				scanType = "B-Tree Order Scan (Deep Pagination Fast Path)"
+				indexUsed = orderField
+			}
+		}
+	}
+
+	// Check 5: Búsqueda indexada por filtros
+	if !indexOnlyScan && scanType == "Full Table Scan (Sequential)" {
+		_, hasOr := query.Filter[globalconst.OpOr]
+		canShortCircuit := query.Limit != nil && len(query.OrderBy) == 0 && len(query.Aggregations) == 0 && len(query.GroupBy) == 0
+
+		var candidateKeys []string
+		var usedIndex bool
+
+		if canShortCircuit && hasOr {
+			usedIndex = false
+		} else {
+			candidateKeys, usedIndex, _ = h.findCandidateKeysFromFilter(colStore, query.Filter)
+		}
+
+		if usedIndex {
+			scanType = "Index Lookup Scan"
+			indexUsed = h.determineSelectedFilterIndex(colStore, query.Filter)
+
+			// Verificar si se usó Index Merge por cláusula OR
+			if orRaw, exists := query.Filter[globalconst.OpOr]; exists {
+				var orConditions []any
+				if ba, ok := orRaw.(bson.A); ok {
+					orConditions = ba
+				} else if arr, ok := orRaw.([]any); ok {
+					orConditions = arr
+				}
+				if len(orConditions) > 0 {
+					usedIndexMerge = true
+					scanType = "Index Merge (OR) Scan"
+				}
+			}
+			filterCost = len(candidateKeys)
+		} else if len(query.Filter) > 0 {
+			scanType = "Full Table Scan (Filtered)"
+		}
+	}
+
+	explainResult := bson.M{
+		"collection":            collectionName,
+		"index_only_scan":       indexOnlyScan,
+		"scan_type":             scanType,
+		"index_used":            indexUsed,
+		"estimated_filter_cost": filterCost,
+		"used_index_merge":      usedIndexMerge,
+		"execution_time":        time.Since(startTime).String(),
+	}
+
+	return []bson.M{explainResult}, nil
+}
+
+// determineSelectedFilterIndex identifica recursivamente el índice utilizado según el optimizador.
+func (h *ConnectionHandler) determineSelectedFilterIndex(colStore store.DataStore, filter map[string]any) string {
+	if len(filter) == 0 {
+		return ""
+	}
+	if andRaw, exists := filter[globalconst.OpAnd]; exists {
+		var andConditions []any
+		if ba, ok := andRaw.(bson.A); ok {
+			andConditions = ba
+		} else if arr, ok := andRaw.([]any); ok {
+			andConditions = arr
+		}
+		bestIdx := -1
+		minCost := int(^uint(0) >> 1)
+		for i, cond := range andConditions {
+			condMap, isMap := asMap(cond)
+			if !isMap {
+				continue
+			}
+			cost := h.estimateFilterCardinality(colStore, condMap)
+			if cost < minCost {
+				minCost = cost
+				bestIdx = i
+			}
+		}
+		if bestIdx != -1 && minCost != int(^uint(0)>>1) {
+			bestCond, _ := asMap(andConditions[bestIdx])
+			return h.determineSelectedFilterIndex(colStore, bestCond)
+		}
+	}
+	if field, ok := filter["field"].(string); ok {
+		if colStore.HasIndex(field) {
+			return field
+		}
+	}
+	return ""
+}
+

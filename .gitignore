@@ -22,6 +22,7 @@ cat_command.sh
 all_modules.txt
 json/
 data/
+bin/
 
 # Code coverage profiles and other test artifacts
 *.out

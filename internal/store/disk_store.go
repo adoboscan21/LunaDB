@@ -8,8 +8,6 @@ import (
 	"time"
 
 	"go.etcd.io/bbolt"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/bsontype"
 )
 
 // DiskStore implementa DataStore usando bbolt particionado, con índices 100% en disco.
@@ -41,7 +39,7 @@ func (s *DiskStore) Set(key string, value []byte) {
 	shardID := GetShardID(key, TotalShards)
 	batcher := GlobalBatchers[shardID]
 
-	recordBytes, _ := bson.Marshal(ItemRecord{Value: value, CreatedAt: time.Now()})
+	recordBytes, _ := MarshalRecord(ItemRecord{Value: value, CreatedAt: time.Now()})
 
 	// 1. Escribir el documento principal
 	writes := []TxWrite{
@@ -113,11 +111,10 @@ func (s *DiskStore) SetMany(items map[string][]byte) (int, int) {
 						continue
 					}
 
-					// Serialización optimizada con bson.D conservando la Versión
-					recordBytes, _ := bson.Marshal(bson.D{
-						{Key: "v", Value: value},
-						{Key: "c", Value: now},
-						{Key: "ver", Value: uint64(1)}, // Asignamos la primera versión
+					recordBytes, _ := MarshalRecord(ItemRecord{
+						Value:     value,
+						CreatedAt: now,
+						Version:   1,
 					})
 					b.Put([]byte(key), recordBytes)
 
@@ -211,7 +208,7 @@ func (s *DiskStore) DeleteMany(keys []string) {
 						var record ItemRecord
 						// Fast-path: Unmarshal mínimo si es posible.
 						// Para este ejemplo, mantendremos Unmarshal para asegurar que extraemos bien los datos indexados.
-						if bson.Unmarshal(oldVal, &record) == nil {
+						if UnmarshalRecord(oldVal, &record) == nil {
 							oldData := extractIndexedValues(record.Value, indexedFields)
 							for field, val := range oldData {
 								if idxKey := encodeIndexKey(val, k); idxKey != nil {
@@ -259,7 +256,7 @@ func (s *DiskStore) Get(key string) ([]byte, bool) {
 		recordBytes := b.Get([]byte(key))
 		if recordBytes != nil {
 			var record ItemRecord
-			if err := bson.Unmarshal(recordBytes, &record); err == nil {
+			if err := UnmarshalRecord(recordBytes, &record); err == nil {
 				valCopy = make([]byte, len(record.Value))
 				copy(valCopy, record.Value)
 				found = true
@@ -299,13 +296,9 @@ func (s *DiskStore) GetMany(keys []string) map[string][]byte {
 				}
 				for _, k := range keysToFetch {
 					if recordBytes := b.Get([]byte(k)); recordBytes != nil {
-						raw := bson.Raw(recordBytes)
-						if val := raw.Lookup("v"); val.Type == bsontype.Binary {
-							_, data := val.Binary()
-							// Copia segura de la memoria mmap de bbolt
-							valCopy := make([]byte, len(data))
-							copy(valCopy, data)
-							localRes[k] = valCopy
+						var record ItemRecord
+						if err := UnmarshalRecord(recordBytes, &record); err == nil {
+							localRes[k] = record.Value
 						}
 					}
 				}
@@ -350,10 +343,9 @@ func (s *DiskStore) StreamAll(cb func(key string, value []byte) bool) {
 					if atomic.LoadInt32(&stop) == 1 {
 						break
 					}
-					raw := bson.Raw(v)
-					if val := raw.Lookup("v"); val.Type == bsontype.Binary {
-						_, data := val.Binary()
-						if !cb(string(k), data) {
+					var record ItemRecord
+					if err := UnmarshalRecord(v, &record); err == nil {
+						if !cb(string(k), record.Value) {
 							atomic.StoreInt32(&stop, 1)
 							break
 						}
@@ -419,10 +411,10 @@ func (s *DiskStore) UpdateMany(items map[string][]byte) (int, []string) {
 					}
 
 					var oldRecord ItemRecord
-					bson.Unmarshal(existing, &oldRecord)
+					UnmarshalRecord(existing, &oldRecord)
 
 					// Incrementamos la versión cuidando el control de MVCC
-					recordBytes, _ := bson.Marshal(ItemRecord{
+					recordBytes, _ := MarshalRecord(ItemRecord{
 						Value:     newValue,
 						CreatedAt: oldRecord.CreatedAt,
 						Version:   oldRecord.Version + 1, // Incrementamos la versión anterior

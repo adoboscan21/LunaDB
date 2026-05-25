@@ -32,6 +32,7 @@ type Query struct {
 	Distinct     string                 `bson:"distinct,omitempty"`     // DISTINCT field
 	Projection   []string               `bson:"projection,omitempty"`
 	Lookups      []LookupClause         `bson:"lookups,omitempty"`
+	Explain      bool                   `bson:"explain,omitempty"`
 }
 
 // OrderByClause defines a single ordering criterion.
@@ -59,6 +60,7 @@ func (q *Query) Reset() {
 	q.Distinct = ""
 	q.Projection = nil
 	q.Lookups = nil
+	q.Explain = false
 }
 
 // A pool for Query objects to reduce memory allocation overhead.

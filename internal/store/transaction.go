@@ -177,7 +177,7 @@ func (tm *TransactionManager) Commit(txID string) error {
 				if b != nil {
 					if existingBytes := b.Get([]byte(op.Key)); existingBytes != nil {
 						var rec ItemRecord
-						if bson.Unmarshal(existingBytes, &rec) == nil {
+						if UnmarshalRecord(existingBytes, &rec) == nil {
 							oldVal = rec.Value
 						}
 					}
@@ -212,7 +212,7 @@ func (tm *TransactionManager) Commit(txID string) error {
 						if b != nil {
 							if existingBytes := b.Get([]byte(op.Key)); existingBytes != nil {
 								var tempRec ItemRecord
-								if bson.Unmarshal(existingBytes, &tempRec) == nil {
+								if UnmarshalRecord(existingBytes, &tempRec) == nil {
 									expectedVersion = tempRec.Version
 									newVersion = tempRec.Version + 1
 									checkVersion = true
@@ -227,7 +227,7 @@ func (tm *TransactionManager) Commit(txID string) error {
 						CreatedAt: now,
 						Version:   newVersion,
 					}
-					recBytes, _ := bson.Marshal(newRec)
+					recBytes, _ := MarshalRecord(newRec)
 
 					// Escribir documento principal
 					localTxWrites = append(localTxWrites, TxWrite{
@@ -286,7 +286,7 @@ func (tm *TransactionManager) Commit(txID string) error {
 						if b != nil {
 							if existingBytes := b.Get([]byte(op.Key)); existingBytes != nil {
 								var tempRec ItemRecord
-								if bson.Unmarshal(existingBytes, &tempRec) == nil {
+								if UnmarshalRecord(existingBytes, &tempRec) == nil {
 									expectedVersion = tempRec.Version
 									checkVersion = true
 								}
